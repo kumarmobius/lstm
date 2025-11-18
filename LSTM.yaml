@@ -1,0 +1,308 @@
+name: Partial Fit LSTM
+inputs:
+  - {name: model_object, type: Model, description: "Path to torch-saved model object (or file containing model state_dict)."}
+  - {name: pth_file, type: Model, description: "Path to the .pth checkpoint file to load weights from."}
+  - {name: train_loader, type: Dataset, description: "Path to a torch-saved dataset or iterable used for training (used for seeding and for incoming new batch)."}
+  - {name: test_loader, type: Dataset, description: "Path to a torch-saved dataset or iterable used for validation."}
+  - {name: input_dim, type: String, description: "Input dimension (string or int)."}
+  - {name: model_config, type: Dataset, description: "Path to JSON config file with hyperparameters (optional)."}
+  - {name: updated_pth, type: Model, description: "Output directory path where updated_model.pth will be saved."}
+
+outputs:
+  - {name: updated_pth, type: Model, description: "Updated model checkpoint saved after partial_fit."}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v25
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, copy, random, torch, numpy as np
+        import torch.nn as nn
+        from torch.utils.data import TensorDataset, DataLoader, ConcatDataset
+
+        parser = argparse.ArgumentParser(description="Partial-fit LSTM using torch-saved inputs")
+        parser.add_argument("--model_object", required=True, help="Path to saved model object (.pt/.pth) or its state_dict")
+        parser.add_argument("--pth_file", required=True, help="Checkpoint .pth file (weights) to load")
+        parser.add_argument("--train_loader", required=True, help="Path to torch-saved train dataset / iterable")
+        parser.add_argument("--test_loader", required=True, help="Path to torch-saved test dataset / iterable")
+        parser.add_argument("--input_dim", required=True, help="Input dimension (int or string)")
+        parser.add_argument("--model_config", required=False, help="Path to JSON config with hyperparams")
+        parser.add_argument("--updated_pth", required=True, help="Output directory to save updated_model.pth")
+        args = parser.parse_args()
+
+        # --- helpers ---
+        def load_torch_obj(path):
+            if not os.path.exists(path):
+                raise FileNotFoundError(f\"File not found: {path}\")
+            return torch.load(path, map_location='cpu')
+
+        def extract_state_dict(ckpt):
+            # return a state_dict if possible
+            if isinstance(ckpt, dict) and ('model_state' in ckpt or 'state_dict' in ckpt):
+                state = ckpt.get('model_state', ckpt.get('state_dict'))
+                return state
+            if isinstance(ckpt, dict) and any(k.startswith('module.') or '.' in k for k in ckpt.keys()):
+                # looks like state_dict
+                return ckpt
+            return None
+
+        def strip_module_prefix(state_dict):
+            new_state = {}
+            for k,v in state_dict.items():
+                if k.startswith('module.'):
+                    new_state[k.replace('module.','',1)] = v
+                else:
+                    new_state[k] = v
+            return new_state
+
+        class ReplayBuffer:
+            def __init__(self, capacity=2000):
+                self.capacity = int(capacity)
+                self.X = []
+                self.y = []
+                self.n_seen = 0
+            def add_batch(self, X_batch, y_batch):
+                if isinstance(X_batch, torch.Tensor):
+                    X_batch = X_batch.detach().cpu().numpy()
+                if isinstance(y_batch, torch.Tensor):
+                    y_batch = y_batch.detach().cpu().numpy()
+                for xb, yb in zip(X_batch, y_batch):
+                    self.n_seen += 1
+                    if len(self.X) < self.capacity:
+                        self.X.append(np.copy(xb))
+                        self.y.append(np.copy(yb))
+                    else:
+                        prob = self.capacity / float(self.n_seen)
+                        if random.random() < prob:
+                            idx = random.randrange(self.capacity)
+                            self.X[idx] = np.copy(xb)
+                            self.y[idx] = np.copy(yb)
+            def sample(self, k):
+                if len(self.X) == 0:
+                    return None, None
+                k = min(k, len(self.X))
+                idx = random.sample(range(len(self.X)), k)
+                Xs = np.stack([self.X[i] for i in idx])
+                ys = np.stack([self.y[i] for i in idx])
+                return Xs, ys
+            def __len__(self):
+                return len(self.X)
+
+        # --- load model object (expect a saved model instance OR a dict/state_dict file) ---
+        print(\"[partial_fit] Loading model object from:\", args.model_object)
+        model_obj = load_torch_obj(args.model_object)
+
+        # If user saved a full model instance, use it. Otherwise expect we got a state_dict or mapping
+        if hasattr(model_obj, 'eval') and hasattr(model_obj, 'train'):
+            model = model_obj
+            print(\"[partial_fit] Loaded full model object (instance). Will load weights on top if provided.\")
+        else:
+            # model_obj likely a state_dict; we need a model instance to load into.
+            print(\"[partial_fit] Model object file did not contain an instantiated model. Expecting state_dict.\") 
+            print(\"[partial_fit] Aborting because this YAML expects a saved model object that can be instantiated via torch.load().\") 
+            sys.exit(1)
+
+        # --- load checkpoint weights and apply ---
+        print(\"[partial_fit] Loading checkpoint weights from:\", args.pth_file)
+        ckpt = load_torch_obj(args.pth_file)
+        state = extract_state_dict(ckpt)
+        if state is None:
+            # maybe ckpt is a state_dict itself or a full model instance
+            if hasattr(ckpt, 'state_dict'):
+                try:
+                    model.load_state_dict(ckpt.state_dict(), strict=False)
+                    print(\"[partial_fit] Loaded weights from a full model saved in checkpoint.\")
+                except Exception as e:
+                    print(\"[partial_fit] Failed to load state from saved full model:\", e)
+                    sys.exit(1)
+            else:
+                print(\"[partial_fit] Couldn't extract state_dict from checkpoint. Trying to load directly...\")
+                try:
+                    model.load_state_dict(ckpt, strict=False)
+                except Exception as e:
+                    print(\"[partial_fit] Direct load failed:\", e)
+                    sys.exit(1)
+        else:
+            # apply state (strip module. if needed)
+            state = strip_module_prefix(state)
+            model.load_state_dict(state, strict=False)
+            print(\"[partial_fit] State dict loaded into model (strict=False).\")
+
+        # --- load config (if present) ---
+        model_config = {}
+        if args.model_config:
+            if os.path.exists(args.model_config):
+                with open(args.model_config, 'r') as f:
+                    try:
+                        model_config = json.load(f)
+                    except Exception:
+                        # try yaml fallback if needed
+                        import yaml
+                        f.seek(0)
+                        model_config = yaml.safe_load(f)
+                print(\"[partial_fit] Loaded model_config keys:\", list(model_config.keys()))
+            else:
+                print(\"[partial_fit] model_config path not found, continuing with defaults.\")
+
+        # parameters
+        base_lr = float(model_config.get('learning_rate', 0.001))
+        finetune_lr_factor = float(model_config.get('finetune_lr_factor', 0.01))
+        finetune_epochs = int(model_config.get('finetune_epochs', 1))
+        replay_capacity = int(model_config.get('replay_capacity', 2000))
+        replay_samples = int(model_config.get('replay_samples', 256))
+        loss_name = model_config.get('loss_function', 'BCEWithLogitsLoss')
+
+        finetune_lr = base_lr * finetune_lr_factor
+
+        # --- load train/test data objects (torch-saved) ---
+        print(\"[partial_fit] Loading train_loader from:\", args.train_loader)
+        train_obj = load_torch_obj(args.train_loader)
+        print(\"[partial_fit] Loading test_loader from:\", args.test_loader)
+        test_obj = load_torch_obj(args.test_loader)
+
+        # Accept either DataLoader, Dataset, list of (x,y) pairs, or torch-saved TensorDataset
+        def iterable_from(obj):
+            # DataLoader-like
+            if hasattr(obj, '__iter__') and not isinstance(obj, dict):
+                return obj
+            # If dict or other, fail
+            raise RuntimeError(\"train/test object is not iterable - expected DataLoader/list/TensorDataset saved via torch.save\")
+
+        train_iter = iterable_from(train_obj)
+        test_iter = iterable_from(test_obj)
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model.to(device)
+
+        # --- seed replay buffer from a few batches of train_iter ---
+        replay = ReplayBuffer(capacity=replay_capacity)
+        print(\"[partial_fit] Seeding replay buffer from train data (up to 50 batches)...\")
+        try:
+            count = 0
+            for batch in train_iter:
+                x, y = batch
+                replay.add_batch(x, y)
+                count += 1
+                if count >= 50 or len(replay) >= min(1000, replay_capacity):
+                    break
+            print(f\"[partial_fit] Seeded replay with {len(replay)} samples (from {count} batches)\")
+        except Exception as e:
+            print(\"[partial_fit] Warning: failed to seed replay buffer from train_iter:\", e)
+
+        # --- pick one incoming new batch (simulate streaming) from train_iter ---
+        print(\"[partial_fit] Selecting an incoming new batch from train_iter...\")
+        try:
+            # re-open train iterator (if it's list-like we can index)
+            new_batch = None
+            if isinstance(train_obj, (list, tuple)):
+                new_batch = train_obj[0]
+            else:
+                # if it's an iterator/generator / DataLoader, get next()
+                new_batch = next(iter(train_obj))
+            X_new, y_new = new_batch
+        except Exception as e:
+            print(\"[partial_fit] ERROR: could not obtain new batch from train_loader:\", e)
+            sys.exit(1)
+
+        # --- prepare mixed dataset (X_new + replay samples) ---
+        X_new_t = X_new.detach().cpu() if isinstance(X_new, torch.Tensor) else torch.tensor(X_new, dtype=torch.float32)
+        y_new_t = y_new.detach().cpu() if isinstance(y_new, torch.Tensor) else torch.tensor(y_new, dtype=torch.float32)
+
+        X_rep_np, y_rep_np = replay.sample(replay_samples)
+        if X_rep_np is not None:
+            X_rep_t = torch.tensor(X_rep_np, dtype=torch.float32)
+            y_rep_t = torch.tensor(y_rep_np, dtype=torch.float32)
+            ds_new = TensorDataset(X_new_t, y_new_t)
+            ds_rep = TensorDataset(X_rep_t, y_rep_t)
+            train_ds = ConcatDataset([ds_new, ds_rep])
+        else:
+            train_ds = TensorDataset(X_new_t, y_new_t)
+
+        train_loader_local = DataLoader(train_ds, batch_size= int(model_config.get('batch_size', 32)), shuffle=True)
+
+        # --- setup optimizer + loss ---
+        optimizer = torch.optim.Adam(model.parameters(), lr=finetune_lr)
+        if loss_name.lower().startswith('bce'):
+            loss_fn = nn.BCEWithLogitsLoss()
+        elif loss_name.lower().startswith('mse'):
+            loss_fn = nn.MSELoss()
+        elif loss_name.lower().startswith('cross'):
+            loss_fn = nn.CrossEntropyLoss()
+        else:
+            loss_fn = nn.BCEWithLogitsLoss()
+
+        # save pre-update state for potential rollback
+        model_ckpt = copy.deepcopy(model.state_dict())
+
+        # --- partial-fit training (few epochs) ---
+        print(f\"[partial_fit] Finetuning for {finetune_epochs} epoch(s) with lr={finetune_lr:.6g}\")
+        model.train()
+        last_loss = None
+        for ep in range(finetune_epochs):
+            running = 0.0
+            total_n = 0
+            for xb, yb in train_loader_local:
+                xb = xb.to(device).float()
+                yb = yb.to(device).float()
+                optimizer.zero_grad()
+                out = model(xb)
+                # adapt shapes: if out is (B,1) and yb is (B,) squeeze appropriately
+                loss = loss_fn(out.squeeze(), yb.squeeze())
+                loss.backward()
+                optimizer.step()
+                bs = xb.size(0)
+                running += loss.item() * bs
+                total_n += bs
+            last_loss = running / max(1, total_n)
+            print(f\"[partial_fit] Epoch {ep+1}/{finetune_epochs} avg_loss={last_loss:.6f}\")
+
+        # --- validate on test_iter ---
+        print(\"[partial_fit] Running validation on test_loader...\")
+        model.eval()
+        total = 0.0
+        n = 0
+        with torch.no_grad():
+            for batch in test_iter:
+                xb, yb = batch
+                xb = xb.to(device).float()
+                yb = yb.to(device).float()
+                out = model(xb)
+                loss = loss_fn(out.squeeze(), yb.squeeze())
+                bs = xb.size(0)
+                total += loss.item() * bs
+                n += bs
+        val_loss = total / max(1, n) if n > 0 else None
+        print(f\"[partial_fit] Validation loss after update: {val_loss}\")
+
+        # --- simple rollback rule: if val_loss is None, save; otherwise save (no baseline to compare) ---
+        # Note: orchestration should supply baseline val loss if strict rollback desired.
+        os.makedirs(args.updated_pth, exist_ok=True)
+        out_path = os.path.join(args.updated_pth, 'updated_model.pth')
+        try:
+            torch.save(model.state_dict(), out_path)
+            print(\"[partial_fit] Saved updated model state_dict at:\", out_path)
+        except Exception as e:
+            print(\"[partial_fit] ERROR saving checkpoint:\", e)
+            # attempt to rollback in-memory
+            model.load_state_dict(model_ckpt)
+            sys.exit(1)
+
+        print(\"[partial_fit] Completed successfully.\")
+    args:
+      - --model_object
+      - {inputPath: model_object}
+      - --pth_file
+      - {inputPath: pth_file}
+      - --train_loader
+      - {inputPath: train_loader}
+      - --test_loader
+      - {inputPath: test_loader}
+      - --input_dim
+      - {inputValue: input_dim}
+      - --model_config
+      - {inputPath: model_config}
+      - --updated_pth
+      - {outputPath: updated_pth}
