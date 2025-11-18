@@ -1,4 +1,4 @@
-name: Partial Fit LSTM v2
+name: Partial Fit LSTM v3
 inputs:
   - {name: model_object, type: Model, description: "Path to torch-saved model object (should contain an instantiated model or a saved instance)."}
   - {name: pth_file, type: Model, description: "Path to the .pth checkpoint file to load weights from (state_dict or wrapper)."}
@@ -18,10 +18,6 @@ implementation:
       - -u
       - -c
       - |
-        """
-        Partial-fit inline CLI script for LSTM (argparse) - Continuous Learning
-        Expected to be run inside container with torch available.
-        """
         import argparse, os, sys, json, copy, random, traceback
         import torch
         import torch.nn as nn
