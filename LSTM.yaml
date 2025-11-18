@@ -1,4 +1,4 @@
-name: Partial Fit LSTM v1
+name: Partial Fit LSTM v2
 inputs:
   - {name: model_object, type: Model, description: "Path to torch-saved model object (should contain an instantiated model or a saved instance)."}
   - {name: pth_file, type: Model, description: "Path to the .pth checkpoint file to load weights from (state_dict or wrapper)."}
@@ -62,7 +62,6 @@ implementation:
             return new_state
 
         class ReplayBuffer:
-            """Reservoir sampling based replay buffer for continual learning"""
             def __init__(self, capacity=2000):
                 self.capacity = int(capacity)
                 self.X = []
@@ -166,7 +165,6 @@ implementation:
                 print("[partial_fit] Warning: failed to parse model_config JSON string:", e)
                 print("[partial_fit] Continuing with defaults.")
 
-        # set hyperparams (with safe defaults)
         base_lr = float(model_config.get('learning_rate', 1e-3))
         finetune_lr_factor = float(model_config.get('finetune_lr_factor', 0.1))
         finetune_epochs = int(model_config.get('finetune_epochs', 3))
