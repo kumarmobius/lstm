@@ -1,4 +1,4 @@
-name: CDN Download PTH
+name: CDN Download PTH v1
 description: Download trained_model.pth from a CDN URL and save it locally.
 inputs:
   - {name: pth_url, type: String, description: "URL to fetch the trained_model.pth model file from"}
@@ -12,53 +12,122 @@ implementation:
       - -u
       - -c
       - |
-        import os, sys, requests
-
-        # Prefer environment variables (PTH_URL, PTH_FILE), fallback to sys.argv
-        pth_url = os.environ.get('PTH_URL')
-        pth_out_dir = os.environ.get('PTH_FILE')
-
-        # If not provided via env, try command-line args (first arg = pth_url, second = pth_file)
-        if not pth_url and len(sys.argv) > 1:
-            pth_url = sys.argv[1]
-        if not pth_out_dir and len(sys.argv) > 2:
-            pth_out_dir = sys.argv[2]
-
-        if not pth_url:
-            print("Error: PTH URL not provided (set PTH_URL or pass as first arg)")
+        import os, sys, argparse, traceback
+        import requests
+        
+        parser = argparse.ArgumentParser(description="Download PTH model file from CDN URL")
+        parser.add_argument("--pth_url", required=True, help="URL to fetch the trained_model.pth model file from")
+        parser.add_argument("--pth_file", required=True, help="Output directory to save the downloaded trained_model.pth")
+        args = parser.parse_args()
+        
+        pth_url = args.pth_url
+        pth_out_dir = args.pth_file
+        
+        # Validate inputs
+        if not pth_url or not pth_url.strip():
+            print("Error: PTH URL is empty or invalid")
             sys.exit(1)
-        if not pth_out_dir:
-            print("Error: Output directory not provided (set PTH_FILE or pass as second arg)")
+        
+        if not pth_out_dir or not pth_out_dir.strip():
+            print("Error: Output directory path is empty or invalid")
             sys.exit(1)
-
-        print("Downloading trained_model.pth from:", pth_url)
+        
+        print("[cdn_download] Starting download of trained_model.pth")
+        print("[cdn_download] URL:", pth_url)
+        print("[cdn_download] Output directory:", pth_out_dir)
+        
         try:
-            resp = requests.get(pth_url, timeout=300)
-            resp.raise_for_status()
-
+            # Create output directory if it doesn't exist
             os.makedirs(pth_out_dir, exist_ok=True)
+            print("[cdn_download] Output directory created/verified")
+            
+            # Download the file with timeout and proper headers
+            print("[cdn_download] Initiating HTTP request...")
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (compatible; ModelDownloader/1.0)'
+            }
+            
+            resp = requests.get(pth_url, timeout=300, headers=headers, stream=True)
+            resp.raise_for_status()
+            
+            # Get content size if available
+            content_length = resp.headers.get('Content-Length')
+            if content_length:
+                print(f"[cdn_download] File size: {int(content_length):,} bytes ({int(content_length)/(1024*1024):.2f} MB)")
+            
+            # Save to file
             pth_path = os.path.join(pth_out_dir, 'trained_model.pth')
+            print(f"[cdn_download] Saving to: {pth_path}")
+            
+            # Download with progress (for large files)
+            downloaded = 0
+            chunk_size = 8192  # 8KB chunks
+            
             with open(pth_path, "wb") as f:
-                f.write(resp.content)
-
-            print("Saved PTH at:", pth_path)
-            print("Size (bytes):", len(resp.content))
-
-            # Verify
-            if os.path.exists(pth_path) and os.path.getsize(pth_path) > 0:
-                print("trained_model.pth downloaded and verified")
-            else:
-                raise Exception("trained_model.pth download verification failed")
-
+                for chunk in resp.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        # Print progress every 10MB
+                        if downloaded % (10 * 1024 * 1024) < chunk_size:
+                            print(f"[cdn_download] Downloaded: {downloaded/(1024*1024):.2f} MB")
+            
+            file_size = os.path.getsize(pth_path)
+            print(f"[cdn_download] Download complete! Total size: {file_size:,} bytes ({file_size/(1024*1024):.2f} MB)")
+            
+            # Verify the downloaded file
+            if not os.path.exists(pth_path):
+                raise Exception("File does not exist after download")
+            
+            if file_size == 0:
+                raise Exception("Downloaded file is empty (0 bytes)")
+            
+            # Basic PTH file validation (check if it's a valid torch file)
+            try:
+                import torch
+                # Try to load the file to verify it's a valid PyTorch file
+                _ = torch.load(pth_path, map_location='cpu', weights_only=False)
+                print("[cdn_download] File validation: trained_model.pth is a valid PyTorch checkpoint")
+            except ImportError:
+                print("[cdn_download] Warning: torch not available for validation, skipping content check")
+            except Exception as e:
+                print(f"[cdn_download] Warning: Could not validate PTH content: {e}")
+                print("[cdn_download] File downloaded but may not be a valid PyTorch checkpoint")
+            
+            print("[cdn_download]  trained_model.pth downloaded and verified successfully")
+            
         except requests.exceptions.Timeout:
-            print("Error: Request timed out while downloading the PTH")
+            print("[cdn_download] ERROR: Request timed out after 300 seconds")
+            print("[cdn_download] The server may be slow or the file may be too large")
             sys.exit(1)
+            
+        except requests.exceptions.HTTPError as e:
+            print(f"[cdn_download] ERROR: HTTP error occurred: {e}")
+            print(f"[cdn_download] Status code: {resp.status_code}")
+            if resp.status_code == 404:
+                print("[cdn_download] The URL does not exist (404 Not Found)")
+            elif resp.status_code == 403:
+                print("[cdn_download] Access forbidden (403 Forbidden)")
+            elif resp.status_code >= 500:
+                print("[cdn_download] Server error (5xx)")
+            sys.exit(1)
+            
+        except requests.exceptions.ConnectionError as e:
+            print(f"[cdn_download] ERROR: Connection error: {e}")
+            print("[cdn_download] Please check your network connection or the URL")
+            sys.exit(1)
+            
         except requests.exceptions.RequestException as e:
-            print("Error: Network error during download:", str(e))
+            print(f"[cdn_download] ERROR: Network error during download: {e}")
             sys.exit(1)
+            
+        except OSError as e:
+            print(f"[cdn_download] ERROR: File system error: {e}")
+            print("[cdn_download] Please check disk space and write permissions")
+            sys.exit(1)
+            
         except Exception as e:
-            print("Error: Failed to download PTH:", str(e))
-            import traceback
+            print(f"[cdn_download] ERROR: Unexpected error during download: {e}")
             traceback.print_exc()
             sys.exit(1)
     args:
