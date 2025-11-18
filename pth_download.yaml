@@ -1,0 +1,63 @@
+name: CDN Download PTH
+description: Downloads trained_model.pth file from CDN URL and saves it locally.
+inputs:
+  - {name: pth_url, type: String, description: "URL to fetch the trained_model.pth file from"}
+outputs:
+  - {name: pth_file, type: Model, description: "Downloaded trained_model.pth model file"}
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v22
+    command:
+      - sh
+      - -c
+      - |
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet requests || \
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet requests --user
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import os
+        import requests
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--pth_url', type=str, required=True)
+        parser.add_argument('--pth_file', type=str, required=True)
+        args = parser.parse_args()
+
+        print("Received pth_url:", args.pth_url)
+
+        try:
+            # Download trained_model.pth
+            print("Fetching trained_model.pth from CDN:", args.pth_url)
+            resp_pth = requests.get(args.pth_url, timeout=300)
+            resp_pth.raise_for_status()
+
+            os.makedirs(args.pth_file, exist_ok=True)
+            pth_path = os.path.join(args.pth_file, 'trained_model.pth')
+
+            with open(pth_path, "wb") as f:
+                f.write(resp_pth.content)
+
+            print("PTH model file saved at:", pth_path)
+            print("Downloaded size:", len(resp_pth.content), "bytes")
+
+            # Verify file
+            if os.path.exists(pth_path) and os.path.getsize(pth_path) > 0:
+                print("trained_model.pth downloaded and verified successfully!")
+            else:
+                raise Exception("trained_model.pth download verification failed")
+
+        except Exception as e:
+            print("Error downloading trained_model.pth:", str(e))
+            import traceback
+            traceback.print_exc()
+            exit(1)
+
+    args:
+      - --pth_url
+      - {inputValue: pth_url}
+      - --pth_file
+      - {outputPath: pth_file}
