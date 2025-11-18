@@ -1,11 +1,11 @@
-name: Partial Fit LSTM
+name: Partial Fit LSTM v1
 inputs:
   - {name: model_object, type: Model, description: "Path to torch-saved model object (should contain an instantiated model or a saved instance)."}
   - {name: pth_file, type: Model, description: "Path to the .pth checkpoint file to load weights from (state_dict or wrapper)."}
   - {name: train_loader, type: Dataset, description: "Path to a torch-saved train dataset/iterable (DataLoader, TensorDataset, or list of (x,y) pairs)."}
   - {name: test_loader, type: Dataset, description: "Path to a torch-saved test dataset/iterable (for validation)."}
   - {name: input_dim, type: String, description: "Input dimension (string or int). Used only if model needs to be re-instantiated (not required if model instance provided)."}
-  - {name: model_config, type: Dataset, description: "Optional JSON or YAML file with model hyperparameters (learning_rate, finetune_epochs, etc.)."}
+  - {name: model_config, type: String, description: "Optional JSON string with model hyperparameters (learning_rate, finetune_epochs, etc.)."}
 
 outputs:
   - {name: updated_pth_dir, type: Model, description: "Directory where updated_model.pth will be saved automatically after partial_fit."}
@@ -19,7 +19,7 @@ implementation:
       - -c
       - |
         """
-        Partial-fit inline CLI script for LSTM (argparse).
+        Partial-fit inline CLI script for LSTM (argparse) - Continuous Learning
         Expected to be run inside container with torch available.
         """
         import argparse, os, sys, json, copy, random, traceback
@@ -33,8 +33,8 @@ implementation:
         parser.add_argument("--pth_file", required=True, help="Checkpoint .pth file (weights) to load")
         parser.add_argument("--train_loader", required=True, help="Path to torch-saved train dataset / iterable")
         parser.add_argument("--test_loader", required=True, help="Path to torch-saved test dataset / iterable")
-        parser.add_argument("--input_dim", required=False, help="Input dimension (int or string) - optional")
-        parser.add_argument("--model_config", required=False, help="Path to JSON/YAML config with hyperparams (optional)")
+        parser.add_argument("--input_dim", required=False, default="", help="Input dimension (int or string) - optional")
+        parser.add_argument("--model_config", required=False, default="", help="JSON string with hyperparams (optional)")
         parser.add_argument("--updated_pth_dir", required=True, help="Output directory to save updated_model.pth (this is an outputPath)")
         args = parser.parse_args()
 
@@ -42,13 +42,13 @@ implementation:
         def load_torch_obj(path):
             if not os.path.exists(path):
                 raise FileNotFoundError(f"File not found: {path}")
-            return torch.load(path, map_location='cpu')
+            return torch.load(path, map_location='cpu', weights_only=False)
 
         def extract_state_dict(ckpt):
             # return a state_dict if possible
             if isinstance(ckpt, dict) and ('model_state' in ckpt or 'state_dict' in ckpt):
                 return ckpt.get('model_state', ckpt.get('state_dict'))
-            if isinstance(ckpt, dict) and any(isinstance(k, str) and (k.startswith('module.') or '.' in k) for k in ckpt.keys()):
+            if isinstance(ckpt, dict) and any(isinstance(k, str) and ('.' in k) for k in ckpt.keys()):
                 return ckpt
             return None
 
@@ -62,27 +62,32 @@ implementation:
             return new_state
 
         class ReplayBuffer:
+            """Reservoir sampling based replay buffer for continual learning"""
             def __init__(self, capacity=2000):
                 self.capacity = int(capacity)
                 self.X = []
                 self.y = []
                 self.n_seen = 0
+            
             def add_batch(self, X_batch, y_batch):
                 if isinstance(X_batch, torch.Tensor):
                     X_batch = X_batch.detach().cpu().numpy()
                 if isinstance(y_batch, torch.Tensor):
                     y_batch = y_batch.detach().cpu().numpy()
+                
                 for xb, yb in zip(X_batch, y_batch):
                     self.n_seen += 1
                     if len(self.X) < self.capacity:
                         self.X.append(np.copy(xb))
                         self.y.append(np.copy(yb))
                     else:
+                        # Reservoir sampling: replace with decreasing probability
                         prob = self.capacity / float(self.n_seen)
                         if random.random() < prob:
                             idx = random.randrange(self.capacity)
                             self.X[idx] = np.copy(xb)
                             self.y[idx] = np.copy(yb)
+            
             def sample(self, k):
                 if len(self.X) == 0:
                     return None, None
@@ -91,6 +96,7 @@ implementation:
                 Xs = np.stack([self.X[i] for i in idx])
                 ys = np.stack([self.y[i] for i in idx])
                 return Xs, ys
+            
             def __len__(self):
                 return len(self.X)
 
@@ -109,13 +115,13 @@ implementation:
             traceback.print_exc()
             sys.exit(1)
 
-        # If loaded object is an instantiated model, use it. Otherwise abort (this YAML expects a saved model instance).
+        # If loaded object is an instantiated model, use it
         if hasattr(model_obj, 'eval') and hasattr(model_obj, 'train'):
             model = model_obj
             print("[partial_fit] Loaded model instance from file.")
         else:
             print("[partial_fit] The provided model_object does not appear to be an instantiated model.")
-            print("[partial_fit] Please save/ provide a torch-saved model instance (torch.save(model, path)). Aborting.")
+            print("[partial_fit] Please save/provide a torch-saved model instance (torch.save(model, path)). Aborting.")
             sys.exit(1)
 
         # --- load checkpoint weights and apply ---
@@ -123,6 +129,7 @@ implementation:
             print("[partial_fit] Loading checkpoint weights from:", args.pth_file)
             ckpt = load_torch_obj(args.pth_file)
             state = extract_state_dict(ckpt)
+            
             if state is None:
                 # maybe ckpt is a full model instance
                 if hasattr(ckpt, 'state_dict'):
@@ -149,31 +156,29 @@ implementation:
             traceback.print_exc()
             sys.exit(1)
 
-        # --- load config (if present) ---
+        # --- load config (from JSON string) ---
         model_config = {}
-        if args.model_config:
-            if os.path.exists(args.model_config):
-                try:
-                    with open(args.model_config, 'r') as f:
-                        model_config = json.load(f)
-                except Exception:
-                    import yaml
-                    with open(args.model_config, 'r') as f:
-                        model_config = yaml.safe_load(f)
+        if args.model_config and args.model_config.strip():
+            try:
+                model_config = json.loads(args.model_config)
                 print("[partial_fit] Loaded model_config keys:", list(model_config.keys()))
-            else:
-                print("[partial_fit] model_config path not found, continuing with defaults.")
+            except Exception as e:
+                print("[partial_fit] Warning: failed to parse model_config JSON string:", e)
+                print("[partial_fit] Continuing with defaults.")
 
         # set hyperparams (with safe defaults)
         base_lr = float(model_config.get('learning_rate', 1e-3))
-        finetune_lr_factor = float(model_config.get('finetune_lr_factor', 0.01))
-        finetune_epochs = int(model_config.get('finetune_epochs', 1))
+        finetune_lr_factor = float(model_config.get('finetune_lr_factor', 0.1))
+        finetune_epochs = int(model_config.get('finetune_epochs', 3))
         replay_capacity = int(model_config.get('replay_capacity', 2000))
         replay_samples = int(model_config.get('replay_samples', 256))
         batch_size = int(model_config.get('batch_size', 32))
         loss_name = model_config.get('loss_function', 'BCEWithLogitsLoss')
+        use_all_train = bool(model_config.get('use_all_train_data', False))
 
         finetune_lr = base_lr * finetune_lr_factor
+
+        print(f"[partial_fit] Hyperparameters: lr={finetune_lr:.6g}, epochs={finetune_epochs}, replay_cap={replay_capacity}, replay_samples={replay_samples}")
 
         # --- load train/test data objects (torch-saved) ---
         try:
@@ -195,51 +200,80 @@ implementation:
             sys.exit(1)
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"[partial_fit] Using device: {device}")
         model.to(device)
 
-        # --- seed replay buffer from a few batches of train_iter ---
+        # --- seed replay buffer from train data ---
         replay = ReplayBuffer(capacity=replay_capacity)
-        print("[partial_fit] Seeding replay buffer from train data (up to 50 batches)...")
+        print("[partial_fit] Seeding replay buffer from train data...")
+        
+        all_train_batches = []
         try:
-            count = 0
-            # If train_obj is list-like we can iterate directly; otherwise iterate once
             for batch in train_iter:
                 if batch is None:
                     break
                 try:
                     x, y = batch
+                    all_train_batches.append((x, y))
                 except Exception:
-                    # skip malformed batch
                     continue
+            
+            print(f"[partial_fit] Collected {len(all_train_batches)} training batches")
+            
+            # Seed replay buffer from earlier batches (simulating previous tasks)
+            num_seed_batches = max(1, len(all_train_batches) - 1) if len(all_train_batches) > 1 else 0
+            for i in range(num_seed_batches):
+                x, y = all_train_batches[i]
                 replay.add_batch(x, y)
-                count += 1
-                if count >= 50 or len(replay) >= min(1000, replay_capacity):
-                    break
-            print(f"[partial_fit] Seeded replay with {len(replay)} samples (from {count} batches)")
+            
+            print(f"[partial_fit] Seeded replay buffer with {len(replay)} samples from {num_seed_batches} batches")
         except Exception as e:
-            print("[partial_fit] Warning: failed to seed replay buffer from train_iter:", e)
+            print("[partial_fit] Warning: failed to seed replay buffer:", e)
+            traceback.print_exc()
 
-        # --- pick one incoming new batch (simulate streaming) from train_obj ---
-        print("[partial_fit] Selecting an incoming new batch from train data...")
+        # --- get new incoming data ---
+        print("[partial_fit] Preparing new incoming data for continual learning...")
         X_new = None
         y_new = None
-        try:
-            if isinstance(train_obj, (list, tuple)):
-                if len(train_obj) == 0:
-                    raise RuntimeError("train_loader list is empty")
-                new_batch = train_obj[0]
-            else:
-                new_batch = next(iter(train_obj))
-            X_new, y_new = new_batch
-        except Exception as e:
-            print("[partial_fit] ERROR: could not obtain new batch from train_loader:", e)
-            traceback.print_exc()
-            sys.exit(1)
+        
+        if use_all_train and len(all_train_batches) > 0:
+            # Use all training data (combine all batches)
+            print("[partial_fit] Using ALL training data")
+            X_list = []
+            y_list = []
+            for x, y in all_train_batches:
+                x_t = x.detach().cpu() if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.float32)
+                y_t = y.detach().cpu() if isinstance(y, torch.Tensor) else torch.tensor(y, dtype=torch.float32)
+                X_list.append(x_t)
+                y_list.append(y_t)
+            X_new = torch.cat(X_list, dim=0)
+            y_new = torch.cat(y_list, dim=0)
+        else:
+            # Use only the last batch as new data (simulating streaming)
+            try:
+                if len(all_train_batches) > 0:
+                    X_new, y_new = all_train_batches[-1]
+                    print("[partial_fit] Using last batch as new incoming data")
+                else:
+                    # Fallback: try to get from train_obj
+                    if isinstance(train_obj, (list, tuple)):
+                        if len(train_obj) == 0:
+                            raise RuntimeError("train_loader list is empty")
+                        X_new, y_new = train_obj[-1]
+                    else:
+                        # Get first batch
+                        X_new, y_new = next(iter(train_obj))
+            except Exception as e:
+                print("[partial_fit] ERROR: could not obtain new batch from train_loader:", e)
+                traceback.print_exc()
+                sys.exit(1)
 
-        # --- prepare mixed dataset (X_new + replay samples) ---
+        # --- prepare mixed dataset (new data + replay samples) for continual learning ---
         try:
             X_new_t = X_new.detach().cpu() if isinstance(X_new, torch.Tensor) else torch.tensor(X_new, dtype=torch.float32)
             y_new_t = y_new.detach().cpu() if isinstance(y_new, torch.Tensor) else torch.tensor(y_new, dtype=torch.float32)
+            
+            print(f"[partial_fit] New data shape: X={X_new_t.shape}, y={y_new_t.shape}")
         except Exception as e:
             print("[partial_fit] ERROR converting new batch to tensors:", e)
             traceback.print_exc()
@@ -247,14 +281,16 @@ implementation:
 
         try:
             X_rep_np, y_rep_np = replay.sample(replay_samples)
-            if X_rep_np is not None:
+            if X_rep_np is not None and len(replay) > 0:
                 X_rep_t = torch.tensor(X_rep_np, dtype=torch.float32)
                 y_rep_t = torch.tensor(y_rep_np, dtype=torch.float32)
                 ds_new = TensorDataset(X_new_t, y_new_t)
                 ds_rep = TensorDataset(X_rep_t, y_rep_t)
                 train_ds = ConcatDataset([ds_new, ds_rep])
+                print(f"[partial_fit] Mixed dataset: {len(X_new_t)} new + {len(X_rep_t)} replay samples")
             else:
                 train_ds = TensorDataset(X_new_t, y_new_t)
+                print(f"[partial_fit] Using only new data: {len(X_new_t)} samples (no replay)")
         except Exception as e:
             print("[partial_fit] ERROR preparing mixed dataset:", e)
             traceback.print_exc()
@@ -264,6 +300,7 @@ implementation:
 
         # --- setup optimizer + loss ---
         optimizer = torch.optim.Adam(model.parameters(), lr=finetune_lr)
+        
         if loss_name.lower().startswith('bce'):
             loss_fn = nn.BCEWithLogitsLoss()
         elif loss_name.lower().startswith('mse'):
@@ -272,38 +309,58 @@ implementation:
             loss_fn = nn.CrossEntropyLoss()
         else:
             loss_fn = nn.BCEWithLogitsLoss()
+        
+        print(f"[partial_fit] Using loss function: {loss_fn.__class__.__name__}")
 
         # save pre-update state for potential rollback
         model_ckpt = copy.deepcopy(model.state_dict())
 
-        # --- partial-fit training (few epochs) ---
-        print(f"[partial_fit] Finetuning for {finetune_epochs} epoch(s) with lr={finetune_lr:.6g}")
+        # --- partial-fit training (continual learning) ---
+        print(f"[partial_fit] Starting continual learning for {finetune_epochs} epoch(s) with lr={finetune_lr:.6g}")
         model.train()
         last_loss = None
+        
         try:
             for ep in range(finetune_epochs):
                 running = 0.0
                 total_n = 0
+                num_batches = 0
+                
                 for xb, yb in train_loader_local:
                     xb = xb.to(device).float()
                     yb = yb.to(device).float()
+                    
                     optimizer.zero_grad()
                     out = model(xb)
-                    # adapt shapes: if out is (B,1) and yb is (B,) squeeze appropriately
-                    loss = loss_fn(out.squeeze(), yb.squeeze())
+                    
+                    # Handle different output shapes
+                    if out.dim() > yb.dim():
+                        out = out.squeeze(-1)
+                    if yb.dim() > out.dim():
+                        yb = yb.squeeze(-1)
+                    
+                    loss = loss_fn(out, yb)
                     loss.backward()
+                    
+                    # Gradient clipping for stability
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
                     optimizer.step()
+                    
                     bs = xb.size(0)
                     running += loss.item() * bs
                     total_n += bs
+                    num_batches += 1
+                
                 last_loss = running / max(1, total_n)
-                print(f"[partial_fit] Epoch {ep+1}/{finetune_epochs} avg_loss={last_loss:.6f}")
+                print(f"[partial_fit] Epoch {ep+1}/{finetune_epochs} - avg_loss={last_loss:.6f} ({num_batches} batches)")
         except Exception as e:
             print("[partial_fit] ERROR during finetuning:", e)
             traceback.print_exc()
             # rollback to previous in-memory state
             try:
                 model.load_state_dict(model_ckpt)
+                print("[partial_fit] Rolled back to previous model state")
             except Exception:
                 pass
             sys.exit(1)
@@ -313,6 +370,8 @@ implementation:
         model.eval()
         total = 0.0
         n = 0
+        num_test_batches = 0
+        
         try:
             with torch.no_grad():
                 for batch in test_iter:
@@ -320,15 +379,25 @@ implementation:
                         xb, yb = batch
                     except Exception:
                         continue
+                    
                     xb = xb.to(device).float()
                     yb = yb.to(device).float()
                     out = model(xb)
-                    loss = loss_fn(out.squeeze(), yb.squeeze())
+                    
+                    # Handle different output shapes
+                    if out.dim() > yb.dim():
+                        out = out.squeeze(-1)
+                    if yb.dim() > out.dim():
+                        yb = yb.squeeze(-1)
+                    
+                    loss = loss_fn(out, yb)
                     bs = xb.size(0)
                     total += loss.item() * bs
                     n += bs
+                    num_test_batches += 1
+            
             val_loss = total / max(1, n) if n > 0 else None
-            print(f"[partial_fit] Validation loss after update: {val_loss}")
+            print(f"[partial_fit] Validation - loss={val_loss:.6f} ({num_test_batches} batches, {n} samples)")
         except Exception as e:
             print("[partial_fit] WARNING: validation failed:", e)
             traceback.print_exc()
@@ -339,8 +408,20 @@ implementation:
             out_dir = args.updated_pth_dir
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, 'updated_model.pth')
-            torch.save(model.state_dict(), out_path)
-            print("[partial_fit] Saved updated model state_dict at:", out_path)
+            
+            # Save with metadata
+            checkpoint = {
+                'model_state': model.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'train_loss': last_loss,
+                'val_loss': val_loss,
+                'config': model_config,
+                'replay_buffer_size': len(replay)
+            }
+            
+            torch.save(checkpoint, out_path)
+            print("[partial_fit] Saved updated model checkpoint at:", out_path)
+            print(f"[partial_fit] Checkpoint includes: model_state, optimizer_state, losses, config")
         except Exception as e:
             print("[partial_fit] ERROR saving checkpoint:", e)
             traceback.print_exc()
@@ -351,7 +432,10 @@ implementation:
                 pass
             sys.exit(1)
 
-        print("[partial_fit] Completed successfully.")
+        print("[partial_fit] Continual learning completed successfully.")
+        print(f"[partial_fit] Final training loss: {last_loss:.6f}")
+        if val_loss is not None:
+            print(f"[partial_fit] Final validation loss: {val_loss:.6f}")
     args:
       - --model_object
       - {inputPath: model_object}
@@ -364,6 +448,6 @@ implementation:
       - --input_dim
       - {inputValue: input_dim}
       - --model_config
-      - {inputPath: model_config}
+      - {inputValue: model_config}
       - --updated_pth_dir
       - {outputPath: updated_pth_dir}
