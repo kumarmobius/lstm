@@ -1,0 +1,151 @@
+name: Upload to CDN (model)
+description: Uploads a model .pth file to a CDN using curl and outputs the public URL (also uploads a config string).
+inputs:
+  - {name: model_pth, type: Model, description: "Trained model file (e.g., trained_model.pth)"}
+  - {name: config_string, type: String, description: "Configuration string (e.g., JSON)"}
+  - {name: bearer_token, type: string, description: "Bearer token for CDN authentication"}
+  - {name: domain, type: String, description: "CDN domain base (e.g., https://api.example.com)"}
+  - {name: get_cdn, type: String, description: "Public CDN base URL to prepend to returned relative cdnUrl"}
+outputs:
+  - {name: model_cdn_url, type: String, description: "URL to the uploaded .pth model file"}
+  - {name: config_cdn_url, type: String, description: "URL to the uploaded config string"}
+implementation:
+  container:
+    image: python:3.8-slim
+    command:
+      - sh
+      - -ec
+      - |
+        # The container image needs curl
+        if ! command -v curl &> /dev/null; then
+            echo "curl could not be found, installing..."
+            apt-get update > /dev/null && apt-get install -y curl > /dev/null
+        fi
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import subprocess
+        import json
+        import os
+        import uuid
+
+        parser = argparse.ArgumentParser(description="Upload model and config to a CDN.")
+        parser.add_argument('--model_pth', type=str, required=True, help='Path to the model .pth file.')
+        parser.add_argument('--config_string', type=str, required=True, help='Configuration string (e.g., JSON).')
+        parser.add_argument('--model_cdn_url', type=str, required=True, help='Path to the output file for the model CDN URL.')
+        parser.add_argument('--config_cdn_url', type=str, required=True, help='Path to the output file for the config CDN URL.')
+        parser.add_argument('--bearer_token', type=str, required=True, help='Path to file containing Bearer token for CDN authentication.')
+        parser.add_argument('--domain', type=str, required=True, help='CDN API domain (e.g., https://api.example.com).')
+        parser.add_argument('--get_cdn', type=str, required=True, help='Public CDN base URL to prepend to returned relative cdnUrl.')
+        args = parser.parse_args()
+
+        # Read bearer token from provided path
+        with open(args.bearer_token, 'r') as f:
+            bearer_token = f.read().strip()
+
+        upload_url = f"{args.domain}/mobius-content-service/v1.0/content/upload?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
+
+        def upload_file_to_cdn(file_path, output_cdn_url_path, filename_prefix):
+            original_filename = os.path.basename(file_path)
+            cdn_filename = f"{filename_prefix}_{original_filename}"
+            print(f"Uploading file from {file_path} with CDN name {cdn_filename} to {upload_url}...")
+
+            curl_command = [
+                "curl",
+                "--location", upload_url,
+                "--header", f"Authorization: Bearer {bearer_token}",
+                "--form", f"file=@{file_path}",
+                "--fail",
+                "--show-error"
+            ]
+            print(f"Executing curl command: {' '.join(curl_command)}")
+
+            try:
+                process = subprocess.run(
+                    curl_command,
+                    capture_output=True,
+                    check=True
+                )
+
+                stdout = process.stdout.decode('utf-8')
+                print("Upload successful. Raw response:")
+                print(stdout)
+
+                response_json = json.loads(stdout)
+                relative_cdn_url = response_json.get("cdnUrl", None)
+
+                if not relative_cdn_url:
+                    print("Error: 'cdnUrl' not found in server response.")
+                    print("Full response:", stdout)
+                    raise ValueError("Failed to parse cdnUrl from CDN response.")
+
+                content_url_value = f"{args.get_cdn}{relative_cdn_url}"
+                print(f"Extracted CDN URL: {content_url_value}")
+
+                output_dir = os.path.dirname(output_cdn_url_path)
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+
+                with open(output_cdn_url_path, "w") as f:
+                    f.write(content_url_value)
+
+                return content_url_value
+
+            except subprocess.CalledProcessError as e:
+                print("Error executing curl command:")
+                print(f"Return code: {e.returncode}")
+                try:
+                    print(f"Output: {e.stdout.decode('utf-8')}")
+                    print(f"Error Output: {e.stderr.decode('utf-8')}")
+                except:
+                    pass
+                raise e
+            except (json.JSONDecodeError, KeyError, ValueError) as e:
+                print(f"Error processing the server response: {e}")
+                raise e
+
+        # Read model .pth file bytes
+        try:
+            with open(args.model_pth, "rb") as f:
+                model_bytes = f.read()
+            print(f"Successfully read model bytes from {args.model_pth}.")
+        except Exception as e:
+            print(f"Error reading model file {args.model_pth}: {e}")
+            raise e
+
+        # Write model bytes to a temporary file and upload
+        model_temp_file = f"/tmp/model_{uuid.uuid4()}.pth"
+        with open(model_temp_file, 'wb') as f:
+            f.write(model_bytes)
+
+        model_url = upload_file_to_cdn(model_temp_file, args.model_cdn_url, "model")
+        os.remove(model_temp_file)
+
+        # Write config string to a temporary file and upload it
+        config_temp_file = f"/tmp/config_{uuid.uuid4()}.json"
+        with open(config_temp_file, 'w') as f:
+            f.write(args.config_string)
+
+        config_url = upload_file_to_cdn(config_temp_file, args.config_cdn_url, "config")
+        os.remove(config_temp_file)
+
+        print(f"Final Model CDN URL: {model_url}")
+        print(f"Final Config CDN URL: {config_url}")
+    args:
+      - --model_pth
+      - {inputPath: model_pth}
+      - --config_string
+      - {inputValue: config_string}
+      - --bearer_token
+      - {inputPath: bearer_token}
+      - --get_cdn
+      - {inputValue: get_cdn}
+      - --domain
+      - {inputValue: domain}
+      - --model_cdn_url
+      - {outputPath: model_cdn_url}
+      - --config_cdn_url
+      - {outputPath: config_cdn_url}
