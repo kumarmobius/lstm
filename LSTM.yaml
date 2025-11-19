@@ -37,7 +37,6 @@ implementation:
 
         # --- helpers ---
         def load_model_object(path):
-            """Load model from either pickle or torch format"""
             if not os.path.exists(path):
                 raise FileNotFoundError(f"File not found: {path}")
             
