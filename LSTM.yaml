@@ -1,4 +1,4 @@
-name: Partial Fit LSTM v5
+name: Partial Fit LSTM v6
 inputs:
   - {name: model_object, type: Model, description: "Path to torch-saved model object (should contain an instantiated model or a saved instance)."}
   - {name: pth_file, type: Model, description: "Path to the .pth checkpoint file to load weights from (state_dict or wrapper)."}
@@ -35,53 +35,79 @@ implementation:
         args = parser.parse_args()
 
         # --- helpers ---
-        def find_actual_file(path):
+        def find_actual_file(path, prefer_exts=(".pth", ".pt")):
+            """
+            Given a path that may be a file or a directory (Kubeflow/Argo mounts),
+            return the actual file path to use. Preference is given to files with
+            extensions in prefer_exts; otherwise returns first non-hidden file found.
+            """
+            # direct file
             if os.path.isfile(path):
                 return path
-            
-            # Check if path/data exists (Kubeflow pattern)
-            data_path = os.path.join(path, 'data')
+
+            # sometimes tools mount the file as `<path>/data`
+            data_path = os.path.join(path, "data")
             if os.path.isfile(data_path):
                 return data_path
-            
-            # If path is a directory, find first file inside
+
+            # if it's a directory, walk and find preferred files first
             if os.path.isdir(path):
-                files = []
-                for root, dirs, filenames in os.walk(path):
-                    for f in filenames:
-                        if not f.startswith('.'):
-                            files.append(os.path.join(root, f))
-                if files:
-                    print(f"[DEBUG] Found files in directory: {files}")
-                    return files[0]
-            
+                candidates = []
+                for root, dirs, files in os.walk(path):
+                    for f in files:
+                        if f.startswith('.'):
+                            continue
+                        candidates.append(os.path.join(root, f))
+
+                if not candidates:
+                    raise FileNotFoundError(f"No files found inside directory: {path}")
+
+                # prefer extensions in prefer_exts (in order)
+                for ext in prefer_exts:
+                    for c in candidates:
+                        if c.lower().endswith(ext):
+                            return c
+
+                # fallback: return first candidate (deterministic sorted order)
+                candidates = sorted(candidates)
+                return candidates[0]
+
+            # if we reach here, return original path so caller can handle error
             return path
 
         def load_torch_obj(path):
             actual_path = find_actual_file(path)
             print(f"[DEBUG] Attempting to load from: {actual_path}")
-            
+
             if not os.path.exists(actual_path):
                 raise FileNotFoundError(f"File not found: {actual_path}")
-            
+
             if os.path.isdir(actual_path):
                 raise IsADirectoryError(f"Path is a directory, not a file: {actual_path}")
-            
-            # Try torch.load first
+
+            # Try torch.load first (weights_only=False allows loading full object)
             try:
                 return torch.load(actual_path, map_location='cpu', weights_only=False)
+            except TypeError:
+                # older torch may not have weights_only arg
+                try:
+                    return torch.load(actual_path, map_location='cpu')
+                except Exception as e:
+                    print(f"[partial_fit] torch.load failed (second attempt): {e}")
+                    # fall through to pickle attempt
             except Exception as e:
                 print(f"[partial_fit] torch.load failed: {e}")
-                # Try pickle as fallback
-                try:
-                    print("[partial_fit] Attempting to load with pickle...")
-                    with open(actual_path, 'rb') as f:
-                        obj = pickle.load(f)
-                    print("[partial_fit] Successfully loaded with pickle")
-                    return obj
-                except Exception as e2:
-                    print(f"[partial_fit] Pickle load also failed: {e2}")
-                    raise e
+
+            # Try pickle as fallback
+            try:
+                print("[partial_fit] Attempting to load with pickle fallback...")
+                with open(actual_path, 'rb') as f:
+                    obj = pickle.load(f)
+                print("[partial_fit] Successfully loaded with pickle")
+                return obj
+            except Exception as e2:
+                print(f"[partial_fit] Pickle load failed: {e2}")
+                raise RuntimeError(f"Failed to load object from {actual_path}") from e2
 
         def extract_state_dict(ckpt):
             # return a state_dict if possible
@@ -119,7 +145,6 @@ implementation:
                         self.X.append(np.copy(xb))
                         self.y.append(np.copy(yb))
                     else:
-                        # Reservoir sampling: replace with decreasing probability
                         prob = self.capacity / float(self.n_seen)
                         if random.random() < prob:
                             idx = random.randrange(self.capacity)
