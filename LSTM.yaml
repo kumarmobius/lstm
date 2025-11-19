@@ -1,6 +1,6 @@
-name: Partial Fit LSTM v4
+name: Partial Fit LSTM v5
 inputs:
-  - {name: model_object, type: Model, description: "Path to torch-saved or pickle-saved model object (should contain an instantiated model or a saved instance)."}
+  - {name: model_object, type: Model, description: "Path to torch-saved model object (should contain an instantiated model or a saved instance)."}
   - {name: pth_file, type: Model, description: "Path to the .pth checkpoint file to load weights from (state_dict or wrapper)."}
   - {name: train_loader, type: Dataset, description: "Path to a torch-saved train dataset/iterable (DataLoader, TensorDataset, or list of (x,y) pairs)."}
   - {name: test_loader, type: Dataset, description: "Path to a torch-saved test dataset/iterable (for validation)."}
@@ -18,11 +18,10 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, json, copy, random, traceback
+        import argparse, os, sys, json, copy, random, traceback, pickle, glob
         import torch
         import torch.nn as nn
         import numpy as np
-        import pickle
         from torch.utils.data import TensorDataset, DataLoader, ConcatDataset
 
         parser = argparse.ArgumentParser(description="Partial-fit LSTM using torch-saved inputs")
@@ -36,34 +35,53 @@ implementation:
         args = parser.parse_args()
 
         # --- helpers ---
-        def load_model_object(path):
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"File not found: {path}")
+        def find_actual_file(path):
+            if os.path.isfile(path):
+                return path
+            
+            # Check if path/data exists (Kubeflow pattern)
+            data_path = os.path.join(path, 'data')
+            if os.path.isfile(data_path):
+                return data_path
+            
+            # If path is a directory, find first file inside
+            if os.path.isdir(path):
+                files = []
+                for root, dirs, filenames in os.walk(path):
+                    for f in filenames:
+                        if not f.startswith('.'):
+                            files.append(os.path.join(root, f))
+                if files:
+                    print(f"[DEBUG] Found files in directory: {files}")
+                    return files[0]
+            
+            return path
+
+        def load_torch_obj(path):
+            actual_path = find_actual_file(path)
+            print(f"[DEBUG] Attempting to load from: {actual_path}")
+            
+            if not os.path.exists(actual_path):
+                raise FileNotFoundError(f"File not found: {actual_path}")
+            
+            if os.path.isdir(actual_path):
+                raise IsADirectoryError(f"Path is a directory, not a file: {actual_path}")
             
             # Try torch.load first
             try:
-                print("[partial_fit] Attempting to load with torch.load...")
-                obj = torch.load(path, map_location='cpu', weights_only=False)
-                print("[partial_fit] Successfully loaded with torch.load")
-                return obj
-            except Exception as e1:
-                print(f"[partial_fit] torch.load failed: {e1}")
-                
+                return torch.load(actual_path, map_location='cpu', weights_only=False)
+            except Exception as e:
+                print(f"[partial_fit] torch.load failed: {e}")
                 # Try pickle as fallback
                 try:
                     print("[partial_fit] Attempting to load with pickle...")
-                    with open(path, 'rb') as f:
+                    with open(actual_path, 'rb') as f:
                         obj = pickle.load(f)
                     print("[partial_fit] Successfully loaded with pickle")
                     return obj
                 except Exception as e2:
-                    print(f"[partial_fit] pickle.load also failed: {e2}")
-                    raise RuntimeError(f"Could not load model with torch.load or pickle.load. Torch error: {e1}, Pickle error: {e2}")
-
-        def load_torch_obj(path):
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"File not found: {path}")
-            return torch.load(path, map_location='cpu', weights_only=False)
+                    print(f"[partial_fit] Pickle load also failed: {e2}")
+                    raise e
 
         def extract_state_dict(ckpt):
             # return a state_dict if possible
@@ -126,10 +144,10 @@ implementation:
                 return obj
             raise RuntimeError("train/test object is not iterable - expected DataLoader/list/TensorDataset saved via torch.save")
 
-        # --- load model object (pickle or torch compatible) ---
+        # --- load model object ---
         try:
             print("[partial_fit] Loading model object from:", args.model_object)
-            model_obj = load_model_object(args.model_object)
+            model_obj = load_torch_obj(args.model_object)
         except Exception as e:
             print("[partial_fit] ERROR loading model_object:", e)
             traceback.print_exc()
@@ -141,7 +159,7 @@ implementation:
             print("[partial_fit] Loaded model instance from file.")
         else:
             print("[partial_fit] The provided model_object does not appear to be an instantiated model.")
-            print("[partial_fit] Please save/provide a torch-saved or pickle-saved model instance. Aborting.")
+            print("[partial_fit] Please save/provide a torch-saved model instance (torch.save(model, path)). Aborting.")
             sys.exit(1)
 
         # --- load checkpoint weights and apply ---
