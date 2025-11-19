@@ -36,11 +36,6 @@ implementation:
 
         # --- helpers ---
         def find_actual_file(path, prefer_exts=(".pth", ".pt")):
-            """
-            Given a path that may be a file or a directory (Kubeflow/Argo mounts),
-            return the actual file path to use. Preference is given to files with
-            extensions in prefer_exts; otherwise returns first non-hidden file found.
-            """
             # direct file
             if os.path.isfile(path):
                 return path
