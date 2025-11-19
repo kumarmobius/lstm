@@ -1,4 +1,4 @@
-name: Partial Fit LSTM v7
+name: Partial Fit LSTM v8
 inputs:
   - {name: model_object, type: Model, description: "Path to torch-saved model object (should contain an instantiated model or a saved instance)."}
   - {name: pth_file, type: Model, description: "Path to the .pth checkpoint file to load weights from (state_dict or wrapper)."}
@@ -31,7 +31,7 @@ implementation:
         parser.add_argument("--test_loader", required=True, help="Path to torch-saved test dataset / iterable")
         parser.add_argument("--input_dim", required=False, default="", help="Input dimension (int or string) - optional")
         parser.add_argument("--model_config", required=False, default="", help="JSON string with hyperparams (optional)")
-        parser.add_argument("--updated_pth_file", required=True, help="Output directory to save updated_model.pth (this is an outputPath)")
+        parser.add_argument("--updated_pth_file", required=True, help="Output file path for the updated .pth model (this is an outputPath)")
         args = parser.parse_args()
 
         # --- helpers ---
@@ -80,7 +80,7 @@ implementation:
             if os.path.isdir(actual_path):
                 raise IsADirectoryError(f"Path is a directory, not a file: {actual_path}")
 
-            # Try torch.load first (weights_only=False allows loading full object)
+            # Try torch.load first (weights_only=False allows loading full object on newer torch)
             try:
                 return torch.load(actual_path, map_location='cpu', weights_only=False)
             except TypeError:
@@ -460,25 +460,16 @@ implementation:
             traceback.print_exc()
             val_loss = None
 
-        # --- save updated model automatically to output directory ---
+        # --- save updated model (same style as Train LSTM Model) ---
         try:
             out_path = args.updated_pth_file
-        
-            # If runtime pre-created a directory at out_path (common in some runtimes),
-            # write the actual .pth file inside that directory.
-            if os.path.isdir(out_path) or out_path.endswith(os.sep):
-                # ensure directory exists
-                dir_path = out_path if os.path.isdir(out_path) else out_path.rstrip(os.sep)
-                os.makedirs(dir_path, exist_ok=True)
-                out_file = os.path.join(dir_path, "updated_model.pth")
-            else:
-                # treat out_path as a file path: ensure parent exists
-                parent = os.path.dirname(out_path)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-                out_file = out_path
-        
-            # Save with metadata (single save to out_file)
+
+            # Ensure parent directory exists (same pattern as Train LSTM Model)
+            parent_dir = os.path.dirname(out_path)
+            if parent_dir and not os.path.exists(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
+
+            # Build checkpoint metadata (single dictionary)
             checkpoint = {
                 'model_state': model.state_dict(),
                 'optimizer_state': optimizer.state_dict(),
@@ -487,9 +478,11 @@ implementation:
                 'config': model_config,
                 'replay_buffer_size': len(replay)
             }
-        
-            torch.save(checkpoint, out_file)
-            print("[partial_fit] Saved updated model checkpoint at:", out_file)
+
+            # Save final checkpoint to the single output file path
+            torch.save(checkpoint, out_path)
+
+            print("[partial_fit] Saved updated model checkpoint at:", out_path)
             print(f"[partial_fit] Checkpoint includes: model_state, optimizer_state, losses, config")
         except Exception as e:
             print("[partial_fit] ERROR saving checkpoint:", e)
