@@ -1,5 +1,4 @@
-name: Upload to CDN (model)
-description: Uploads a model .pth file to a CDN using curl and outputs the public URL (also uploads a config string).
+name: Upload to CDN
 inputs:
   - {name: model_pth, type: Model, description: "Trained model file (e.g., trained_model.pth)"}
   - {name: config_string, type: String, description: "Configuration string (e.g., JSON)"}
@@ -22,6 +21,7 @@ implementation:
         import json
         import os
         import uuid
+        import tempfile
 
         parser = argparse.ArgumentParser(description="Upload model and config to a CDN.")
         parser.add_argument('--model_pth', type=str, required=True)
@@ -33,17 +33,37 @@ implementation:
         parser.add_argument('--get_cdn', type=str, required=True)
         args = parser.parse_args()
 
+        def ensure_parent_dir(path):
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+        def atomic_write_json(path, data):
+            """
+            Write JSON atomically: write to a temp file in same dir and rename.
+            """
+            ensure_parent_dir(path)
+            dirp = os.path.dirname(path) or "/tmp"
+            fd, tmp = tempfile.mkstemp(prefix="tmp_json_", dir=dirp)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f)
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                raise
+
         # Read bearer token
         with open(args.bearer_token, 'r') as f:
             bearer_token = f.read().strip()
 
         upload_url = f"{args.domain}/mobius-content-service/v1.0/content/upload?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
 
-        def write_json_output(key, value, output_path):
-            with open(output_path, "w") as f:
-                json.dump({key: value}, f)
-
         def upload_file_to_cdn(file_path, output_json_path, output_key):
+            print(f"[DEBUG] Uploading {file_path} -> expecting output file {output_json_path} with key '{output_key}'")
             curl_command = [
                 "curl",
                 "--location", upload_url,
@@ -60,37 +80,61 @@ implementation:
                     check=True
                 )
                 stdout = process.stdout.decode("utf-8")
-                response_json = json.loads(stdout)
+                print("[DEBUG] Raw upload response:", stdout)
+
+                try:
+                    response_json = json.loads(stdout)
+                except Exception as e:
+                    print("[ERROR] Failed to parse JSON from upload response:", str(e))
+                    raise
 
                 relative_cdn_url = response_json.get("cdnUrl")
                 if not relative_cdn_url:
-                    raise ValueError("Missing cdnUrl from response")
+                    raise ValueError("Missing 'cdnUrl' in CDN response")
 
                 final_url = f"{args.get_cdn}{relative_cdn_url}"
 
-                write_json_output(output_key, final_url, output_json_path)
+                # Ensure parent dir exists and write JSON atomically
+                atomic_write_json(output_json_path, {output_key: final_url})
+                print(f"[INFO] Wrote {output_key} to {output_json_path}")
 
                 return final_url
 
+            except subprocess.CalledProcessError as e:
+                print("Upload failed. curl return code:", e.returncode)
+                try:
+                    print("curl stdout:", e.stdout.decode("utf-8"))
+                    print("curl stderr:", e.stderr.decode("utf-8"))
+                except Exception:
+                    pass
+                raise
             except Exception as e:
-                print("Upload failed:", str(e))
-                raise e
+                print("Upload_file_to_cdn error:", str(e))
+                raise
 
-        # Upload model
+        # Prepare and upload model
         model_tmp = f"/tmp/model_{uuid.uuid4()}.pth"
-        with open(args.model_pth, "rb") as f:
-            open(model_tmp, "wb").write(f.read())
+        try:
+            with open(args.model_pth, "rb") as src, open(model_tmp, "wb") as dst:
+                dst.write(src.read())
+            model_url = upload_file_to_cdn(model_tmp, args.model_weights_cdn, "model_weights_cdn")
+        finally:
+            try:
+                os.remove(model_tmp)
+            except Exception:
+                pass
 
-        model_url = upload_file_to_cdn(model_tmp, args.model_weights_cdn, "model_weights_cdn")
-        os.remove(model_tmp)
-
-        # Upload config
+        # Prepare and upload config
         config_tmp = f"/tmp/config_{uuid.uuid4()}.json"
-        with open(config_tmp, "w") as f:
-            f.write(args.config_string)
-
-        config_url = upload_file_to_cdn(config_tmp, args.config_cdn_url, "config_cdn_url")
-        os.remove(config_tmp)
+        try:
+            with open(config_tmp, "w") as f:
+                f.write(args.config_string)
+            config_url = upload_file_to_cdn(config_tmp, args.config_cdn_url, "config_cdn_url")
+        finally:
+            try:
+                os.remove(config_tmp)
+            except Exception:
+                pass
 
         print("Model CDN URL:", model_url)
         print("Config CDN URL:", config_url)
