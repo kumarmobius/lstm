@@ -1,4 +1,4 @@
-name: Upload to CDN
+name: Upload to CDN (model)
 description: Uploads a model .pth file to a CDN using curl and outputs the public URL (also uploads a config string).
 inputs:
   - {name: model_pth, type: Model, description: "Trained model file (e.g., trained_model.pth)"}
@@ -7,8 +7,8 @@ inputs:
   - {name: domain, type: String, description: "CDN domain base (e.g., https://api.example.com)"}
   - {name: get_cdn, type: String, description: "Public CDN base URL to prepend to returned relative cdnUrl"}
 outputs:
-  - {name: model_weights_cdn, type: String, description: "URL to the uploaded .pth model file (string)"}
-  - {name: config_cdn_url, type: String, description: "URL to the uploaded config string (string)"}
+  - {name: model_weights_cdn, type: String, description: "JSON containing the model CDN URL"}
+  - {name: config_cdn_url, type: String, description: "JSON containing the config CDN URL"}
 implementation:
   container:
     image: python:3.8
@@ -24,26 +24,26 @@ implementation:
         import uuid
 
         parser = argparse.ArgumentParser(description="Upload model and config to a CDN.")
-        parser.add_argument('--model_pth', type=str, required=True, help='Path to the model .pth file.')
-        parser.add_argument('--config_string', type=str, required=True, help='Configuration string (e.g., JSON).')
-        parser.add_argument('--model_weights_cdn', type=str, required=True, help='Path to the output file for the model CDN URL.')
-        parser.add_argument('--config_cdn_url', type=str, required=True, help='Path to the output file for the config CDN URL.')
-        parser.add_argument('--bearer_token', type=str, required=True, help='Path to file containing Bearer token for CDN authentication.')
-        parser.add_argument('--domain', type=str, required=True, help='CDN API domain (e.g., https://api.example.com).')
-        parser.add_argument('--get_cdn', type=str, required=True, help='Public CDN base URL to prepend to returned relative cdnUrl.')
+        parser.add_argument('--model_pth', type=str, required=True)
+        parser.add_argument('--config_string', type=str, required=True)
+        parser.add_argument('--model_weights_cdn', type=str, required=True)
+        parser.add_argument('--config_cdn_url', type=str, required=True)
+        parser.add_argument('--bearer_token', type=str, required=True)
+        parser.add_argument('--domain', type=str, required=True)
+        parser.add_argument('--get_cdn', type=str, required=True)
         args = parser.parse_args()
 
-        # Read bearer token from provided path
+        # Read bearer token
         with open(args.bearer_token, 'r') as f:
             bearer_token = f.read().strip()
 
         upload_url = f"{args.domain}/mobius-content-service/v1.0/content/upload?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
 
-        def upload_file_to_cdn(file_path, output_cdn_url_path, filename_prefix):
-            original_filename = os.path.basename(file_path)
-            cdn_filename = f"{filename_prefix}_{original_filename}"
-            print(f"Uploading file from {file_path} with CDN name {cdn_filename} to {upload_url}...")
+        def write_json_output(key, value, output_path):
+            with open(output_path, "w") as f:
+                json.dump({key: value}, f)
 
+        def upload_file_to_cdn(file_path, output_json_path, output_key):
             curl_command = [
                 "curl",
                 "--location", upload_url,
@@ -52,7 +52,6 @@ implementation:
                 "--fail",
                 "--show-error"
             ]
-            print(f"Executing curl command: {' '.join(curl_command)}")
 
             try:
                 process = subprocess.run(
@@ -60,72 +59,42 @@ implementation:
                     capture_output=True,
                     check=True
                 )
-
-                stdout = process.stdout.decode('utf-8')
-                print("Upload successful. Raw response:")
-                print(stdout)
-
+                stdout = process.stdout.decode("utf-8")
                 response_json = json.loads(stdout)
-                relative_cdn_url = response_json.get("cdnUrl", None)
 
+                relative_cdn_url = response_json.get("cdnUrl")
                 if not relative_cdn_url:
-                    print("Error: 'cdnUrl' not found in server response.")
-                    print("Full response:", stdout)
-                    raise ValueError("Failed to parse cdnUrl from CDN response.")
+                    raise ValueError("Missing cdnUrl from response")
 
-                content_url_value = f"{args.get_cdn}{relative_cdn_url}"
-                print(f"Extracted CDN URL: {content_url_value}")
+                final_url = f"{args.get_cdn}{relative_cdn_url}"
 
-                output_dir = os.path.dirname(output_cdn_url_path)
-                if output_dir:
-                    os.makedirs(output_dir, exist_ok=True)
+                write_json_output(output_key, final_url, output_json_path)
 
-                # Write the URL as a plain string to the output path (so caller sees a simple string)
-                with open(output_cdn_url_path, "w") as f:
-                    f.write(content_url_value)
+                return final_url
 
-                return content_url_value
-
-            except subprocess.CalledProcessError as e:
-                print("Error executing curl command:")
-                print(f"Return code: {e.returncode}")
-                try:
-                    print(f"Output: {e.stdout.decode('utf-8')}")
-                    print(f"Error Output: {e.stderr.decode('utf-8')}")
-                except:
-                    pass
-                raise e
-            except (json.JSONDecodeError, KeyError, ValueError) as e:
-                print(f"Error processing the server response: {e}")
+            except Exception as e:
+                print("Upload failed:", str(e))
                 raise e
 
-        # Read model .pth file bytes
-        try:
-            with open(args.model_pth, "rb") as f:
-                model_bytes = f.read()
-            print(f"Successfully read model bytes from {args.model_pth}.")
-        except Exception as e:
-            print(f"Error reading model file {args.model_pth}: {e}")
-            raise e
+        # Upload model
+        model_tmp = f"/tmp/model_{uuid.uuid4()}.pth"
+        with open(args.model_pth, "rb") as f:
+            open(model_tmp, "wb").write(f.read())
 
-        # Write model bytes to a temporary file and upload
-        model_temp_file = f"/tmp/model_{uuid.uuid4()}.pth"
-        with open(model_temp_file, 'wb') as f:
-            f.write(model_bytes)
+        model_url = upload_file_to_cdn(model_tmp, args.model_weights_cdn, "model_weights_cdn")
+        os.remove(model_tmp)
 
-        model_url = upload_file_to_cdn(model_temp_file, args.model_weights_cdn, "model")
-        os.remove(model_temp_file)
-
-        # Write config string to a temporary file and upload it
-        config_temp_file = f"/tmp/config_{uuid.uuid4()}.json"
-        with open(config_temp_file, 'w') as f:
+        # Upload config
+        config_tmp = f"/tmp/config_{uuid.uuid4()}.json"
+        with open(config_tmp, "w") as f:
             f.write(args.config_string)
 
-        config_url = upload_file_to_cdn(config_temp_file, args.config_cdn_url, "config")
-        os.remove(config_temp_file)
+        config_url = upload_file_to_cdn(config_tmp, args.config_cdn_url, "config_cdn_url")
+        os.remove(config_tmp)
 
-        print(f"Final Model CDN URL: {model_url}")
-        print(f"Final Config CDN URL: {config_url}")
+        print("Model CDN URL:", model_url)
+        print("Config CDN URL:", config_url)
+
     args:
       - --model_pth
       - {inputPath: model_pth}
