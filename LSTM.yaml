@@ -1,4 +1,4 @@
-name: Partial Fit LSTM v8
+name: Partial Fit LSTM v9
 inputs:
   - {name: model_object, type: Model, description: "Path to torch-saved model object (should contain an instantiated model or a saved instance)."}
   - {name: pth_file, type: Model, description: "Path to the .pth checkpoint file to load weights from (state_dict or wrapper)."}
@@ -6,10 +6,9 @@ inputs:
   - {name: test_loader, type: Dataset, description: "Path to a torch-saved test dataset/iterable (for validation)."}
   - {name: input_dim, type: String, description: "Input dimension (string or int). Used only if model needs to be re-instantiated (not required if model instance provided)."}
   - {name: model_config, type: String, description: "Optional JSON string with model hyperparameters (learning_rate, finetune_epochs, etc.)."}
-
 outputs:
-  - {name: updated_pth_file, type: Model, description: "Updated model .pth file"}
-
+  - {name: trained_model, type: Model, description: "Pickle file containing the updated model checkpoint (pickle dump)."}
+  - {name: parameter_count, type: String, description: "JSON file containing parameter_count keyed value as string, e.g. {\"parameter_count\":\"291365\"}"}
 implementation:
   container:
     image: gurpreetgandhi/nesy-factory:v25
@@ -18,7 +17,7 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, json, copy, random, traceback, pickle, glob
+        import argparse, os, sys, json, copy, random, traceback, pickle, glob, tempfile
         import torch
         import torch.nn as nn
         import numpy as np
@@ -31,21 +30,17 @@ implementation:
         parser.add_argument("--test_loader", required=True, help="Path to torch-saved test dataset / iterable")
         parser.add_argument("--input_dim", required=False, default="", help="Input dimension (int or string) - optional")
         parser.add_argument("--model_config", required=False, default="", help="JSON string with hyperparams (optional)")
-        parser.add_argument("--updated_pth_file", required=True, help="Output file path for the updated .pth model (this is an outputPath)")
+        parser.add_argument("--trained_model", required=True, help="Output file path for the updated pickle model (this is an outputPath)")
+        parser.add_argument("--parameter_count", required=True, help="Output JSON path to write parameter_count as string")
         args = parser.parse_args()
 
-        # --- helpers ---
+        # --- small utilities ---
         def find_actual_file(path, prefer_exts=(".pth", ".pt")):
-            # direct file
             if os.path.isfile(path):
                 return path
-
-            # sometimes tools mount the file as `<path>/data`
             data_path = os.path.join(path, "data")
             if os.path.isfile(data_path):
                 return data_path
-
-            # if it's a directory, walk and find preferred files first
             if os.path.isdir(path):
                 candidates = []
                 for root, dirs, files in os.walk(path):
@@ -53,47 +48,32 @@ implementation:
                         if f.startswith('.'):
                             continue
                         candidates.append(os.path.join(root, f))
-
                 if not candidates:
                     raise FileNotFoundError(f"No files found inside directory: {path}")
-
-                # prefer extensions in prefer_exts (in order)
                 for ext in prefer_exts:
                     for c in candidates:
                         if c.lower().endswith(ext):
                             return c
-
-                # fallback: return first candidate (deterministic sorted order)
                 candidates = sorted(candidates)
                 return candidates[0]
-
-            # if we reach here, return original path so caller can handle error
             return path
 
         def load_torch_obj(path):
             actual_path = find_actual_file(path)
             print(f"[DEBUG] Attempting to load from: {actual_path}")
-
             if not os.path.exists(actual_path):
                 raise FileNotFoundError(f"File not found: {actual_path}")
-
             if os.path.isdir(actual_path):
                 raise IsADirectoryError(f"Path is a directory, not a file: {actual_path}")
-
-            # Try torch.load first (weights_only=False allows loading full object on newer torch)
             try:
                 return torch.load(actual_path, map_location='cpu', weights_only=False)
             except TypeError:
-                # older torch may not have weights_only arg
                 try:
                     return torch.load(actual_path, map_location='cpu')
                 except Exception as e:
                     print(f"[partial_fit] torch.load failed (second attempt): {e}")
-                    # fall through to pickle attempt
             except Exception as e:
                 print(f"[partial_fit] torch.load failed: {e}")
-
-            # Try pickle as fallback
             try:
                 print("[partial_fit] Attempting to load with pickle fallback...")
                 with open(actual_path, 'rb') as f:
@@ -105,7 +85,6 @@ implementation:
                 raise RuntimeError(f"Failed to load object from {actual_path}") from e2
 
         def extract_state_dict(ckpt):
-            # return a state_dict if possible
             if isinstance(ckpt, dict) and ('model_state' in ckpt or 'state_dict' in ckpt):
                 return ckpt.get('model_state', ckpt.get('state_dict'))
             if isinstance(ckpt, dict) and any(isinstance(k, str) and ('.' in k) for k in ckpt.keys()):
@@ -127,13 +106,11 @@ implementation:
                 self.X = []
                 self.y = []
                 self.n_seen = 0
-            
             def add_batch(self, X_batch, y_batch):
                 if isinstance(X_batch, torch.Tensor):
                     X_batch = X_batch.detach().cpu().numpy()
                 if isinstance(y_batch, torch.Tensor):
                     y_batch = y_batch.detach().cpu().numpy()
-                
                 for xb, yb in zip(X_batch, y_batch):
                     self.n_seen += 1
                     if len(self.X) < self.capacity:
@@ -145,7 +122,6 @@ implementation:
                             idx = random.randrange(self.capacity)
                             self.X[idx] = np.copy(xb)
                             self.y[idx] = np.copy(yb)
-            
             def sample(self, k):
                 if len(self.X) == 0:
                     return None, None
@@ -154,15 +130,33 @@ implementation:
                 Xs = np.stack([self.X[i] for i in idx])
                 ys = np.stack([self.y[i] for i in idx])
                 return Xs, ys
-            
             def __len__(self):
                 return len(self.X)
 
         def iterable_from(obj):
-            # Accept DataLoader, Dataset, list/tuple, or generator
             if hasattr(obj, '__iter__') and not isinstance(obj, dict):
                 return obj
             raise RuntimeError("train/test object is not iterable - expected DataLoader/list/TensorDataset saved via torch.save")
+
+        def ensure_parent_dir(path):
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+        def atomic_write_json(path, data):
+            ensure_parent_dir(path)
+            dirp = os.path.dirname(path) or "/tmp"
+            fd, tmp = tempfile.mkstemp(prefix="tmp_json_", dir=dirp)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f)
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                raise
 
         # --- load model object ---
         try:
@@ -173,7 +167,6 @@ implementation:
             traceback.print_exc()
             sys.exit(1)
 
-        # If loaded object is an instantiated model, use it
         if hasattr(model_obj, 'eval') and hasattr(model_obj, 'train'):
             model = model_obj
             print("[partial_fit] Loaded model instance from file.")
@@ -187,9 +180,7 @@ implementation:
             print("[partial_fit] Loading checkpoint weights from:", args.pth_file)
             ckpt = load_torch_obj(args.pth_file)
             state = extract_state_dict(ckpt)
-            
             if state is None:
-                # maybe ckpt is a full model instance
                 if hasattr(ckpt, 'state_dict'):
                     try:
                         model.load_state_dict(ckpt.state_dict(), strict=False)
@@ -198,7 +189,6 @@ implementation:
                         print("[partial_fit] Failed to load state from saved full model:", e)
                         sys.exit(1)
                 else:
-                    # try direct load
                     try:
                         model.load_state_dict(ckpt, strict=False)
                         print("[partial_fit] Loaded checkpoint as state_dict (direct).")
@@ -263,7 +253,6 @@ implementation:
         # --- seed replay buffer from train data ---
         replay = ReplayBuffer(capacity=replay_capacity)
         print("[partial_fit] Seeding replay buffer from train data...")
-        
         all_train_batches = []
         try:
             for batch in train_iter:
@@ -274,15 +263,11 @@ implementation:
                     all_train_batches.append((x, y))
                 except Exception:
                     continue
-            
             print(f"[partial_fit] Collected {len(all_train_batches)} training batches")
-            
-            # Seed replay buffer from earlier batches (simulating previous tasks)
             num_seed_batches = max(1, len(all_train_batches) - 1) if len(all_train_batches) > 1 else 0
             for i in range(num_seed_batches):
                 x, y = all_train_batches[i]
                 replay.add_batch(x, y)
-            
             print(f"[partial_fit] Seeded replay buffer with {len(replay)} samples from {num_seed_batches} batches")
         except Exception as e:
             print("[partial_fit] Warning: failed to seed replay buffer:", e)
@@ -292,9 +277,7 @@ implementation:
         print("[partial_fit] Preparing new incoming data for continual learning...")
         X_new = None
         y_new = None
-        
         if use_all_train and len(all_train_batches) > 0:
-            # Use all training data (combine all batches)
             print("[partial_fit] Using ALL training data")
             X_list = []
             y_list = []
@@ -306,30 +289,25 @@ implementation:
             X_new = torch.cat(X_list, dim=0)
             y_new = torch.cat(y_list, dim=0)
         else:
-            # Use only the last batch as new data (simulating streaming)
             try:
                 if len(all_train_batches) > 0:
                     X_new, y_new = all_train_batches[-1]
                     print("[partial_fit] Using last batch as new incoming data")
                 else:
-                    # Fallback: try to get from train_obj
                     if isinstance(train_obj, (list, tuple)):
                         if len(train_obj) == 0:
                             raise RuntimeError("train_loader list is empty")
                         X_new, y_new = train_obj[-1]
                     else:
-                        # Get first batch
                         X_new, y_new = next(iter(train_obj))
             except Exception as e:
                 print("[partial_fit] ERROR: could not obtain new batch from train_loader:", e)
                 traceback.print_exc()
                 sys.exit(1)
 
-        # --- prepare mixed dataset (new data + replay samples) for continual learning ---
         try:
             X_new_t = X_new.detach().cpu() if isinstance(X_new, torch.Tensor) else torch.tensor(X_new, dtype=torch.float32)
             y_new_t = y_new.detach().cpu() if isinstance(y_new, torch.Tensor) else torch.tensor(y_new, dtype=torch.float32)
-            
             print(f"[partial_fit] New data shape: X={X_new_t.shape}, y={y_new_t.shape}")
         except Exception as e:
             print("[partial_fit] ERROR converting new batch to tensors:", e)
@@ -355,9 +333,7 @@ implementation:
 
         train_loader_local = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
-        # --- setup optimizer + loss ---
         optimizer = torch.optim.Adam(model.parameters(), lr=finetune_lr)
-        
         if loss_name.lower().startswith('bce'):
             loss_fn = nn.BCEWithLogitsLoss()
         elif loss_name.lower().startswith('mse'):
@@ -366,55 +342,40 @@ implementation:
             loss_fn = nn.CrossEntropyLoss()
         else:
             loss_fn = nn.BCEWithLogitsLoss()
-        
         print(f"[partial_fit] Using loss function: {loss_fn.__class__.__name__}")
 
-        # save pre-update state for potential rollback
         model_ckpt = copy.deepcopy(model.state_dict())
 
-        # --- partial-fit training (continual learning) ---
         print(f"[partial_fit] Starting continual learning for {finetune_epochs} epoch(s) with lr={finetune_lr:.6g}")
         model.train()
         last_loss = None
-        
         try:
             for ep in range(finetune_epochs):
                 running = 0.0
                 total_n = 0
                 num_batches = 0
-                
                 for xb, yb in train_loader_local:
                     xb = xb.to(device).float()
                     yb = yb.to(device).float()
-                    
                     optimizer.zero_grad()
                     out = model(xb)
-                    
-                    # Handle different output shapes
                     if out.dim() > yb.dim():
                         out = out.squeeze(-1)
                     if yb.dim() > out.dim():
                         yb = yb.squeeze(-1)
-                    
                     loss = loss_fn(out, yb)
                     loss.backward()
-                    
-                    # Gradient clipping for stability
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    
                     optimizer.step()
-                    
                     bs = xb.size(0)
                     running += loss.item() * bs
                     total_n += bs
                     num_batches += 1
-                
                 last_loss = running / max(1, total_n)
                 print(f"[partial_fit] Epoch {ep+1}/{finetune_epochs} - avg_loss={last_loss:.6f} ({num_batches} batches)")
         except Exception as e:
             print("[partial_fit] ERROR during finetuning:", e)
             traceback.print_exc()
-            # rollback to previous in-memory state
             try:
                 model.load_state_dict(model_ckpt)
                 print("[partial_fit] Rolled back to previous model state")
@@ -422,13 +383,11 @@ implementation:
                 pass
             sys.exit(1)
 
-        # --- validate on test_iter ---
         print("[partial_fit] Running validation on test_loader...")
         model.eval()
         total = 0.0
         n = 0
         num_test_batches = 0
-        
         try:
             with torch.no_grad():
                 for batch in test_iter:
@@ -436,23 +395,18 @@ implementation:
                         xb, yb = batch
                     except Exception:
                         continue
-                    
                     xb = xb.to(device).float()
                     yb = yb.to(device).float()
                     out = model(xb)
-                    
-                    # Handle different output shapes
                     if out.dim() > yb.dim():
                         out = out.squeeze(-1)
                     if yb.dim() > out.dim():
                         yb = yb.squeeze(-1)
-                    
                     loss = loss_fn(out, yb)
                     bs = xb.size(0)
                     total += loss.item() * bs
                     n += bs
                     num_test_batches += 1
-            
             val_loss = total / max(1, n) if n > 0 else None
             print(f"[partial_fit] Validation - loss={val_loss:.6f} ({num_test_batches} batches, {n} samples)")
         except Exception as e:
@@ -460,16 +414,13 @@ implementation:
             traceback.print_exc()
             val_loss = None
 
-        # --- save updated model (same style as Train LSTM Model) ---
+        # --- save updated model as pickle ---
         try:
-            out_path = args.updated_pth_file
-
-            # Ensure parent directory exists (same pattern as Train LSTM Model)
+            out_path = args.trained_model
             parent_dir = os.path.dirname(out_path)
             if parent_dir and not os.path.exists(parent_dir):
                 os.makedirs(parent_dir, exist_ok=True)
 
-            # Build checkpoint metadata (single dictionary)
             checkpoint = {
                 'model_state': model.state_dict(),
                 'optimizer_state': optimizer.state_dict(),
@@ -479,19 +430,29 @@ implementation:
                 'replay_buffer_size': len(replay)
             }
 
-            # Save final checkpoint to the single output file path
-            torch.save(checkpoint, out_path)
+            # Save as pickle (binary) instead of torch.save (per your request)
+            with open(out_path, 'wb') as f:
+                pickle.dump(checkpoint, f)
 
-            print("[partial_fit] Saved updated model checkpoint at:", out_path)
-            print(f"[partial_fit] Checkpoint includes: model_state, optimizer_state, losses, config")
+            print("[partial_fit] Saved updated model checkpoint (pickle) at:", out_path)
         except Exception as e:
             print("[partial_fit] ERROR saving checkpoint:", e)
             traceback.print_exc()
-            # attempt to rollback in-memory
             try:
                 model.load_state_dict(model_ckpt)
             except Exception:
                 pass
+            sys.exit(1)
+
+        # --- compute parameter count and write JSON output (as string) ---
+        try:
+            param_count = sum(p.numel() for p in model.parameters())
+            # write as JSON with string value as requested
+            atomic_write_json(args.parameter_count, {"parameter_count": str(int(param_count))})
+            print(f"[partial_fit] Wrote parameter_count={param_count} to {args.parameter_count}")
+        except Exception as e:
+            print("[partial_fit] ERROR writing parameter_count:", e)
+            traceback.print_exc()
             sys.exit(1)
 
         print("[partial_fit] Continual learning completed successfully.")
@@ -511,5 +472,7 @@ implementation:
       - {inputValue: input_dim}
       - --model_config
       - {inputValue: model_config}
-      - --updated_pth_file
-      - {outputPath: updated_pth_file}
+      - --trained_model
+      - {outputPath: trained_model}
+      - --parameter_count
+      - {outputPath: parameter_count}
