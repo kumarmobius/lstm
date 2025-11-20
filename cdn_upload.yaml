@@ -39,9 +39,6 @@ implementation:
                 os.makedirs(parent, exist_ok=True)
 
         def atomic_write_json(path, data):
-            """
-            Write JSON atomically: write to a temp file in same dir and rename.
-            """
             ensure_parent_dir(path)
             dirp = os.path.dirname(path) or "/tmp"
             fd, tmp = tempfile.mkstemp(prefix="tmp_json_", dir=dirp)
