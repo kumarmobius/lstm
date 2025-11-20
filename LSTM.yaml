@@ -1,14 +1,14 @@
 name: Partial Fit LSTM v9
 inputs:
-  - {name: model_object, type: Model, description: "Path to torch-saved model object (should contain an instantiated model or a saved instance)."}
-  - {name: pth_file, type: Model, description: "Path to the .pth checkpoint file to load weights from (state_dict or wrapper)."}
-  - {name: train_loader, type: Dataset, description: "Path to a torch-saved train dataset/iterable (DataLoader, TensorDataset, or list of (x,y) pairs)."}
-  - {name: test_loader, type: Dataset, description: "Path to a torch-saved test dataset/iterable (for validation)."}
-  - {name: input_dim, type: String, description: "Input dimension (string or int). Used only if model needs to be re-instantiated (not required if model instance provided)."}
-  - {name: model_config, type: String, description: "Optional JSON string with model hyperparameters (learning_rate, finetune_epochs, etc.)."}
+  - {name: model_object, type: Model}
+  - {name: pth_file, type: Model}
+  - {name: train_loader, type: Dataset}
+  - {name: test_loader, type: Dataset}
+  - {name: input_dim, type: String}
+  - {name: model_config, type: String}
 outputs:
-  - {name: trained_model, type: Model, description: "Pickle file containing the updated model checkpoint (pickle dump)."}
-  - {name: parameter_count, type: String, description: "JSON file containing parameter_count keyed value as string, e.g. {\"parameter_count\":\"291365\"}"}
+  - {name: trained_model, type: Model}
+  - {name: parameter_count, type: String}
 implementation:
   container:
     image: gurpreetgandhi/nesy-factory:v25
