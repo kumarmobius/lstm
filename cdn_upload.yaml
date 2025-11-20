@@ -1,4 +1,4 @@
-name: Upload to CDN (model)
+name: Upload to CDN
 description: Uploads a model .pth file to a CDN using curl and outputs the public URL (also uploads a config string).
 inputs:
   - {name: model_pth, type: Model, description: "Trained model file (e.g., trained_model.pth)"}
@@ -7,8 +7,8 @@ inputs:
   - {name: domain, type: String, description: "CDN domain base (e.g., https://api.example.com)"}
   - {name: get_cdn, type: String, description: "Public CDN base URL to prepend to returned relative cdnUrl"}
 outputs:
-  - {name: model_cdn_url, type: String, description: "URL to the uploaded .pth model file"}
-  - {name: config_cdn_url, type: String, description: "URL to the uploaded config string"}
+  - {name: model_weights_cdn, type: String, description: "URL to the uploaded .pth model file (string)"}
+  - {name: config_cdn_url, type: String, description: "URL to the uploaded config string (string)"}
 implementation:
   container:
     image: python:3.8
@@ -26,7 +26,7 @@ implementation:
         parser = argparse.ArgumentParser(description="Upload model and config to a CDN.")
         parser.add_argument('--model_pth', type=str, required=True, help='Path to the model .pth file.')
         parser.add_argument('--config_string', type=str, required=True, help='Configuration string (e.g., JSON).')
-        parser.add_argument('--model_cdn_url', type=str, required=True, help='Path to the output file for the model CDN URL.')
+        parser.add_argument('--model_weights_cdn', type=str, required=True, help='Path to the output file for the model CDN URL.')
         parser.add_argument('--config_cdn_url', type=str, required=True, help='Path to the output file for the config CDN URL.')
         parser.add_argument('--bearer_token', type=str, required=True, help='Path to file containing Bearer token for CDN authentication.')
         parser.add_argument('--domain', type=str, required=True, help='CDN API domain (e.g., https://api.example.com).')
@@ -80,6 +80,7 @@ implementation:
                 if output_dir:
                     os.makedirs(output_dir, exist_ok=True)
 
+                # Write the URL as a plain string to the output path (so caller sees a simple string)
                 with open(output_cdn_url_path, "w") as f:
                     f.write(content_url_value)
 
@@ -112,7 +113,7 @@ implementation:
         with open(model_temp_file, 'wb') as f:
             f.write(model_bytes)
 
-        model_url = upload_file_to_cdn(model_temp_file, args.model_cdn_url, "model")
+        model_url = upload_file_to_cdn(model_temp_file, args.model_weights_cdn, "model")
         os.remove(model_temp_file)
 
         # Write config string to a temporary file and upload it
@@ -136,7 +137,7 @@ implementation:
       - {inputValue: get_cdn}
       - --domain
       - {inputValue: domain}
-      - --model_cdn_url
-      - {outputPath: model_cdn_url}
+      - --model_weights_cdn
+      - {outputPath: model_weights_cdn}
       - --config_cdn_url
       - {outputPath: config_cdn_url}
