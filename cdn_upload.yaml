@@ -2,7 +2,7 @@ name: Upload to CDN V1
 inputs:
   - {name: model_pth, type: Model}
   - {name: config_string, type: String}
-  - {name: bearer_token, type: String}
+  - {name: bearer_token, type: string} #updated
   - {name: domain, type: String}
   - {name: get_cdn, type: String}
   - {name: name, type: String}
