@@ -1,11 +1,11 @@
-name: Upload to CDN
+name: Upload to CDN V1
 inputs:
-  - {name: model_pth, type: Model, description: "Trained model file (e.g., trained_model.pth)"}
-  - {name: config_string, type: String, description: "Configuration string (e.g., JSON)"}
-  - {name: bearer_token, type: string, description: "Bearer token for CDN authentication"}
-  - {name: domain, type: String, description: "CDN domain base (e.g., https://api.example.com)"}
-  - {name: get_cdn, type: String, description: "Public CDN base URL to prepend to returned relative cdnUrl"}
-  - {name: name, type: String, description: "Optional name to include in final outputs", required: false}
+  - {name: model_pth, type: Model}
+  - {name: config_string, type: String}
+  - {name: bearer_token, type: String}
+  - {name: domain, type: String}
+  - {name: get_cdn, type: String}
+  - {name: name, type: String}
 outputs:
   - {name: model_weights_cdn, type: String, description: "JSON containing the model CDN URL (and optional name)"}
   - {name: config_cdn_url, type: String, description: "JSON containing the config CDN URL (and optional name)"}
@@ -62,7 +62,6 @@ implementation:
         upload_url = f"{args.domain}/mobius-content-service/v1.0/content/upload?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
 
         def build_output_dict(key, url):
-            # include name only if provided and non-empty
             out = {key: url}
             if args.name and str(args.name).strip():
                 out['name'] = str(args.name)
@@ -100,7 +99,6 @@ implementation:
 
                 final_url = f"{args.get_cdn}{relative_cdn_url}"
 
-                # Build final JSON object (include name if present) and write atomically
                 out_obj = build_output_dict(output_key, final_url)
                 atomic_write_json(output_json_path, out_obj)
                 print(f"[INFO] Wrote {output_key} to {output_json_path} (included name: {'yes' if 'name' in out_obj else 'no'})")
