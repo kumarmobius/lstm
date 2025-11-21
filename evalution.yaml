@@ -1,10 +1,27 @@
-name: Evaluate LSTM v2
+name: Eval RNN Model v3
+description: |
+  Evaluates an RNN model using the LSTM class from nesy_factory.RNNs.
+  Loads model_state from checkpoint, loads external config JSON (provided as input),
+  runs BaseRNN.eval_step, and saves evaluation metrics as JSON.
+
 inputs:
-  - {name: test_loader, type: Dataset}
-  - {name: model_config, type: String}
-  - {name: trained_model, type: Model}
+  - name: trained_model
+    type: Model
+    description: "Trained model checkpoint containing model_state (torch-saved file or folder)"
+
+  - name: test_loader
+    type: Dataset
+    description: "Torch-saved test DataLoader / iterable (saved with torch.save)"
+
+  - name: config_json
+    type: String
+    description: "JSON file containing model config for instantiating LSTM (external input)"
+
 outputs:
-  - {name: metrics_json, type: String}
+  - name: metrics_json
+    type: Metrics
+    description: "Evaluation metrics saved as JSON"
+
 implementation:
   container:
     image: gurpreetgandhi/nesy-factory:v25
@@ -13,386 +30,195 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, json, tempfile, traceback, importlib
-        import torch
-        import torch.nn as nn
-        import numpy as np
-        from torch.utils.data import TensorDataset, DataLoader
+          import argparse
+          import json
+          import os
+          import sys
+          import traceback
+          import torch
+          import tempfile
 
-        parser = argparse.ArgumentParser(description="Evaluate saved model on test_loader (auto-LSTM fallback)")
-        parser.add_argument("--test_loader", required=True, help="Path to torch-saved test dataset / iterable")
-        parser.add_argument("--model_config", required=False, default="", help="JSON string with eval config (optional)")
-        parser.add_argument("--trained_model", required=True, help="Path to saved model object or checkpoint")
-        parser.add_argument("--metrics_json", required=True, help="Output JSON path for metrics")
-        args = parser.parse_args()
+          def ensure_parent_dir(path):
+              parent = os.path.dirname(path)
+              if parent:
+                  os.makedirs(parent, exist_ok=True)
 
-        def ensure_parent_dir(path):
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
+          def atomic_write_json(path, data):
+              ensure_parent_dir(path)
+              dirp = os.path.dirname(path) or "/tmp"
+              fd, tmp = tempfile.mkstemp(prefix="tmp_json_", dir=dirp)
+              try:
+                  with os.fdopen(fd, "w") as f:
+                      json.dump(data, f)
+                  os.replace(tmp, path)
+              except Exception:
+                  try:
+                      os.remove(tmp)
+                  except Exception:
+                      pass
+                  raise
 
-        def atomic_write_json(path, data):
-            ensure_parent_dir(path)
-            dirp = os.path.dirname(path) or "/tmp"
-            fd, tmp = tempfile.mkstemp(prefix="tmp_json_", dir=dirp)
-            try:
-                with os.fdopen(fd, "w") as f:
-                    json.dump(data, f)
-                os.replace(tmp, path)
-            except Exception:
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
-                raise
+          parser = argparse.ArgumentParser(description="Evaluate LSTM model using nesy_factory.RNNs.LSTM")
+          parser.add_argument("--trained_model", required=True, help="Path to trained model checkpoint (torch-saved)")
+          parser.add_argument("--test_loader", required=True, help="Path to torch-saved test DataLoader/iterable")
+          parser.add_argument("--config_json", required=True, help="Path to external config JSON file")
+          parser.add_argument("--metrics_json", required=True, help="Output path for metrics JSON (file)")
+          args = parser.parse_args()
 
-        def find_actual_file(path, prefer_exts=(".pth", ".pt", ".pkl", ".bin")):
-            if os.path.isfile(path):
-                return path
-            data_path = os.path.join(path, "data")
-            if os.path.isfile(data_path):
-                return data_path
-            if os.path.isdir(path):
-                candidates = []
-                for root, dirs, files in os.walk(path):
-                    for f in files:
-                        if f.startswith('.'):
-                            continue
-                        candidates.append(os.path.join(root, f))
-                if not candidates:
-                    raise FileNotFoundError(f"No files found inside directory: {path}")
-                for ext in prefer_exts:
-                    for c in candidates:
-                        if c.lower().endswith(ext):
-                            return c
-                candidates = sorted(candidates)
-                return candidates[0]
-            return path
+          print("[eval] Args:", args, file=sys.stdout)
 
-        def load_torch_obj(path):
-            actual_path = find_actual_file(path)
-            print(f"[eval] Loading from: {actual_path}")
-            if not os.path.exists(actual_path):
-                raise FileNotFoundError(actual_path)
-            try:
-                return torch.load(actual_path, map_location='cpu')
-            except Exception as e:
-                # fallback to pickle
-                import pickle
-                with open(actual_path, 'rb') as f:
-                    return pickle.load(f)
+          try:
+              # 1) load config
+              print(f"[eval] Loading config from: {args.config_json}", file=sys.stdout)
+              with open(args.config_json, "r") as f:
+                  config = json.load(f)
+              print("[eval] Config keys:", list(config.keys()), file=sys.stdout)
 
-        def try_instantiate_from_spec(spec_str, init_args):
-            if not spec_str:
-                return None
-            try:
-                module_path, cls_name = spec_str.split(":")
-                module = importlib.import_module(module_path)
-                cls = getattr(module, cls_name)
-                return cls(**(init_args or {}))
-            except Exception as e:
-                print("[eval] Failed to import/instantiate model class from spec:", spec_str, e)
-                return None
+              # 2) load checkpoint
+              print(f"[eval] Loading checkpoint from: {args.trained_model}", file=sys.stdout)
+              ckpt_path = args.trained_model
+              # try torch.load and fallback behavior for directories (allow 'data' inside)
+              def find_actual_file(path):
+                  if os.path.isfile(path):
+                      return path
+                  data_path = os.path.join(path, "data")
+                  if os.path.isfile(data_path):
+                      return data_path
+                  if os.path.isdir(path):
+                      candidates = []
+                      for root, _, files in os.walk(path):
+                          for fn in files:
+                              if fn.startswith('.'):
+                                  continue
+                              candidates.append(os.path.join(root, fn))
+                      if not candidates:
+                          raise FileNotFoundError(f"No files found inside directory: {path}")
+                      # prefer common extensions
+                      for ext in (".pth", ".pt", ".pkl", ".bin"):
+                          for c in candidates:
+                              if c.lower().endswith(ext):
+                                  return c
+                      return sorted(candidates)[0]
+                  return path
 
-        def iterable_from(obj):
-            if hasattr(obj, '__iter__') and not isinstance(obj, dict):
-                return obj
-            raise RuntimeError("Provided test object is not iterable - expected DataLoader/list/TensorDataset saved via torch.save")
+              ckpt_actual = find_actual_file(ckpt_path)
+              print(f"[eval] Resolved checkpoint file: {ckpt_actual}", file=sys.stdout)
+              checkpoint = torch.load(ckpt_actual, map_location="cpu")
+              print(f"[eval] Checkpoint type: {type(checkpoint)}", file=sys.stdout)
 
-        # --- simple generic LSTM model used as fallback ---
-        class GenericLSTM(nn.Module):
-            def __init__(self, input_dim, hidden_dim=128, num_layers=1, dropout=0.0, output_dim=1, bidirectional=False):
-                super().__init__()
-                self.hidden_dim = hidden_dim
-                self.num_layers = num_layers
-                self.bidirectional = bidirectional
-                self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, batch_first=True, dropout=dropout, bidirectional=bidirectional)
-                lstm_out_dim = hidden_dim * (2 if bidirectional else 1)
-                self.head = nn.Sequential(
-                    nn.Flatten(),
-                    nn.Linear(lstm_out_dim, output_dim) if output_dim is not None else nn.Identity()
-                )
-            def forward(self, x):
-                # expect x shape: (B, T, input_dim) or (B, input_dim) (handle both)
-                if x.dim() == 2:
-                    # assume (B, input_dim) -> (B, 1, input_dim)
-                    x = x.unsqueeze(1)
-                out, _ = self.lstm(x)
-                # take last timestep
-                last = out[:, -1, :]
-                return self.head(last)
+              # checkpoint must contain model_state (state dict) or possibly be the model itself
+              model_state = None
+              model_instance = None
+              if isinstance(checkpoint, dict):
+                  if "model_state" in checkpoint:
+                      model_state = checkpoint["model_state"]
+                  elif "state_dict" in checkpoint:
+                      model_state = checkpoint["state_dict"]
+                  else:
+                      # maybe the dict is raw state_dict (heuristic)
+                      keys = list(checkpoint.keys())
+                      if keys and isinstance(keys[0], str) and '.' in keys[0]:
+                          model_state = checkpoint
+                      # or it might contain a saved model object under some key
+                      for k in ("model", "net", "module"):
+                          if k in checkpoint and hasattr(checkpoint[k], "__class__"):
+                              model_instance = checkpoint[k]
+                              break
+              else:
+                  # checkpoint might be a saved nn.Module instance if torch.save(model, path) used
+                  model_instance = checkpoint
 
-        # --- parse config ---
-        eval_config = {}
-        if args.model_config and args.model_config.strip():
-            try:
-                eval_config = json.loads(args.model_config)
-                print("[eval] loaded model_config keys:", list(eval_config.keys()))
-            except Exception as e:
-                print("[eval] Warning: failed to parse model_config JSON string:", e)
-                eval_config = {}
+              # 3) import LSTM and instantiate with external config
+              print("[eval] Importing LSTM from nesy_factory.RNNs ...", file=sys.stdout)
+              from nesy_factory.RNNs import LSTM
 
-        loss_name = eval_config.get('loss_function', 'BCEWithLogitsLoss')
-        device_req = eval_config.get('device', None)
-        threshold = float(eval_config.get('threshold', 0.5))
+              print("[eval] Creating model instance using external config ...", file=sys.stdout)
+              model = LSTM(config)
 
-        # --- load trained model (multiple fallback strategies) ---
-        try:
-            trained_obj = load_torch_obj(args.trained_model)
-        except Exception as e:
-            print("[eval] ERROR loading trained_model:", e)
-            traceback.print_exc()
-            sys.exit(1)
+              # if we found saved model instance, try to copy state, otherwise load state_dict if present
+              if model_instance is not None:
+                  try:
+                      # if model_instance is an nn.Module, try to copy weights
+                      model.load_state_dict(model_instance.state_dict(), strict=False)
+                      print("[eval] Loaded weights from model instance in checkpoint.", file=sys.stdout)
+                  except Exception as e:
+                      print("[eval] Warning: could not load weights from saved instance:", e, file=sys.stdout)
+              elif model_state is not None:
+                  # strip module. prefix if present
+                  new_state = {}
+                  for k, v in model_state.items():
+                      if k.startswith("module."):
+                          new_state[k.replace("module.", "", 1)] = v
+                      else:
+                          new_state[k] = v
+                  try:
+                      model.load_state_dict(new_state, strict=False)
+                      print("[eval] Loaded state_dict into model (strict=False).", file=sys.stdout)
+                  except Exception as e:
+                      print("[eval] Warning: loading state_dict failed:", e, file=sys.stdout)
+              else:
+                  print("[eval] WARNING: no model_state or model instance found in checkpoint; proceeding with freshly initialized model.", file=sys.stdout)
 
-        model = None
-        state_dict = None
-        ckpt_config = None
+              # ensure optimizer & criterion exist on model (BaseRNN helper)
+              try:
+                  model._init_optimizer_and_criterion()
+              except Exception as e:
+                  print("[eval] Warning: model._init_optimizer_and_criterion() failed:", e, file=sys.stdout)
 
-        if isinstance(trained_obj, nn.Module):
-            model = trained_obj
-            print("[eval] Loaded model instance directly.")
-        elif isinstance(trained_obj, dict):
-            if 'model_state' in trained_obj:
-                state_dict = trained_obj['model_state']
-                print("[eval] Checkpoint contains 'model_state'.")
-            elif 'state_dict' in trained_obj:
-                state_dict = trained_obj['state_dict']
-                print("[eval] Checkpoint contains 'state_dict'.")
-            else:
-                # heuristic: raw state_dict (keys are strings with '.')
-                keys = list(trained_obj.keys())
-                if keys and isinstance(keys[0], str) and '.' in keys[0]:
-                    state_dict = trained_obj
-                    print("[eval] Loaded object looks like a raw state_dict.")
-                else:
-                    # maybe a saved model under some key
-                    for k in ('model','net','module'):
-                        if k in trained_obj and isinstance(trained_obj[k], nn.Module):
-                            model = trained_obj[k]
-                            print(f"[eval] Found model instance under key '{k}'.")
-                            break
-            # capture checkpoint config if present
-            for cfg_key in ('config','model_config','training_config'):
-                if cfg_key in trained_obj:
-                    ckpt_config = trained_obj[cfg_key]
-                    print(f"[eval] found checkpoint config under key '{cfg_key}'")
-                    break
-        else:
-            print("[eval] Loaded trained_model is of unexpected type:", type(trained_obj))
+              # 4) load test loader
+              print(f"[eval] Loading test loader from: {args.test_loader}", file=sys.stdout)
+              test_path = args.test_loader
+              test_actual = find_actual_file(test_path)
+              test_obj = torch.load(test_actual, map_location="cpu")
 
-        # If we have only a state_dict, try to instantiate model using model_class spec in model_config
-        if model is None and state_dict is not None:
-            model_spec = eval_config.get('model_class', "")
-            model_init_args = eval_config.get('model_init_args', {})
+              # model.eval_step expects an iterable/test dataloader saved via torch.save
+              print("[eval] Running eval_step() ...", file=sys.stdout)
+              metrics = model.eval_step(test_obj)
 
-            if model_spec:
-                model_candidate = try_instantiate_from_spec(model_spec, model_init_args)
-                if model_candidate is not None:
-                    model = model_candidate
-                    print("[eval] Instantiated model from provided model_class spec.")
-            else:
-                # No model spec provided; try to auto-build using checkpoint config if available
-                auto_cfg = eval_config.copy()
-                if ckpt_config and isinstance(ckpt_config, dict):
-                    # merge ckpt_config but don't override explicit eval_config keys
-                    for k, v in ckpt_config.items():
-                        if k not in auto_cfg:
-                            auto_cfg[k] = v
-                    print("[eval] Merged checkpoint config into eval config for auto-instantiation.")
-                # Try to detect LSTM parameters in auto_cfg
-                try:
-                    inp = auto_cfg.get('processed_input_dim') or auto_cfg.get('input_dim') or auto_cfg.get('feature_dim') or auto_cfg.get('input_size')
-                    hidden = auto_cfg.get('hidden_dim') or auto_cfg.get('hidden_size') or auto_cfg.get('hidden')
-                    num_layers = auto_cfg.get('num_layers', auto_cfg.get('n_layers', 1))
-                    dropout = auto_cfg.get('dropout', 0.0)
-                    bidir = auto_cfg.get('bidirectional', False)
-                    out_dim = auto_cfg.get('output_dim') or auto_cfg.get('target_dim') or auto_cfg.get('output_size') or 1
-                    if inp is not None:
-                        # coerce to int
-                        input_dim = int(inp)
-                        hidden_dim = int(hidden) if hidden is not None else 128
-                        num_layers = int(num_layers) if num_layers is not None else 1
-                        dropout = float(dropout) if dropout is not None else 0.0
-                        out_dim = int(out_dim) if out_dim is not None else 1
-                        model = GenericLSTM(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, output_dim=out_dim, bidirectional=bool(bidir))
-                        print(f"[eval] Auto-instantiated GenericLSTM(input_dim={input_dim}, hidden_dim={hidden_dim}, num_layers={num_layers}, dropout={dropout}, output_dim={out_dim})")
-                    else:
-                        print("[eval] Auto-instantiation skipped: could not find input_dim in model_config or checkpoint config.")
-                except Exception as e:
-                    print("[eval] Auto-instantiation failed:", e)
+              # normalize metrics values to native python floats where possible
+              def _norm(v):
+                  if v is None:
+                      return None
+                  try:
+                      return float(v)
+                  except Exception:
+                      return v
+              metrics = {k: (_norm(v) if not isinstance(v, (dict, list)) else v) for k, v in metrics.items()}
 
-        # If we have a model instance and a state_dict, load it (strip 'module.' prefix if needed)
-        if model is not None and state_dict is not None:
-            try:
-                new_state = {}
-                for k, v in state_dict.items():
-                    if k.startswith('module.'):
-                        new_state[k.replace('module.', '', 1)] = v
-                    else:
-                        new_state[k] = v
-                model.load_state_dict(new_state, strict=False)
-                print("[eval] Loaded state_dict into model (strict=False).")
-            except Exception as e:
-                print("[eval] Failed to load state_dict into model:", e)
-                traceback.print_exc()
-                # allow continuing only if model already had weights
-        # If model still None -> error
-        if model is None:
-            print("[eval] ERROR: unable to obtain a torch.nn.Module instance for evaluation.")
-            print("Either provide a saved model instance (torch.save(model, path)) as trained_model,")
-            print("or include 'model_class' (module:ClassName) and 'model_init_args' in model_config so the checkpoint state_dict can be loaded.")
-            sys.exit(1)
+              print("[eval] Metrics computed:", metrics, file=sys.stdout)
 
-        # finalize device
-        device = torch.device(device_req) if device_req else (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
-        model.to(device)
-        model.eval()
+              # 5) write metrics JSON atomically to output path
+              print(f"[eval] Writing metrics to: {args.metrics_json}", file=sys.stdout)
+              atomic_write_json = atomic_write_json if 'atomic_write_json' in globals() else None
+          except Exception as e:
+              print("[eval] ERROR during setup/eval:", e, file=sys.stdout)
+              traceback.print_exc()
+              # still attempt to write an error JSON for debugging
+              try:
+                  err_out = {"error": str(e)}
+                  ensure_parent_dir(args.metrics_json)
+                  with open(args.metrics_json, "w") as f:
+                      json.dump(err_out, f)
+              except Exception:
+                  pass
+              sys.exit(1)
 
-        # load test loader
-        try:
-            test_obj = load_torch_obj(args.test_loader)
-            test_iter = iterable_from(test_obj)
-        except Exception as e:
-            print("[eval] ERROR loading test_loader:", e)
-            traceback.print_exc()
-            sys.exit(1)
-
-        # pick loss function
-        if loss_name.lower().startswith('bce'):
-            loss_fn = nn.BCEWithLogitsLoss()
-            is_binary = True
-        elif loss_name.lower().startswith('mse'):
-            loss_fn = nn.MSELoss()
-            is_binary = False
-        elif loss_name.lower().startswith('cross'):
-            loss_fn = nn.CrossEntropyLoss()
-            is_binary = False
-        else:
-            loss_fn = nn.BCEWithLogitsLoss()
-            is_binary = True
-
-        total_loss = 0.0
-        total_n = 0
-        tp = fp = tn = fn = 0
-        per_class_tp = {}
-        per_class_pred = {}
-        per_class_true = {}
-
-        with torch.no_grad():
-            for batch in test_iter:
-                try:
-                    xb, yb = batch
-                except Exception:
-                    continue
-                xb = xb.to(device).float()
-                yb = yb.to(device)
-                out = model(xb)
-                if isinstance(loss_fn, nn.BCEWithLogitsLoss):
-                    yb_f = yb.float()
-                    if out.dim() > yb_f.dim():
-                        out_proc = out.squeeze(-1)
-                    else:
-                        out_proc = out
-                    loss = loss_fn(out_proc, yb_f)
-                    probs = torch.sigmoid(out_proc)
-                    preds = (probs >= threshold).long()
-                    trues = yb.long()
-                    for p, t in zip(preds.view(-1).cpu().numpy(), trues.view(-1).cpu().numpy()):
-                        if p == 1 and t == 1:
-                            tp += 1
-                        elif p == 1 and t == 0:
-                            fp += 1
-                        elif p == 0 and t == 0:
-                            tn += 1
-                        elif p == 0 and t == 1:
-                            fn += 1
-                    total_n += yb.numel()
-                    total_loss += loss.item() * yb.numel()
-                elif isinstance(loss_fn, nn.CrossEntropyLoss):
-                    loss = loss_fn(out, yb.long())
-                    preds = torch.argmax(out, dim=1)
-                    trues = yb.long()
-                    total_n += yb.size(0)
-                    total_loss += loss.item() * yb.size(0)
-                    for p, t in zip(preds.cpu().numpy(), trues.cpu().numpy()):
-                        per_class_pred[p] = per_class_pred.get(p, 0) + 1
-                        per_class_true[t] = per_class_true.get(t, 0) + 1
-                        if p == t:
-                            per_class_tp[p] = per_class_tp.get(p, 0) + 1
-                else:
-                    try:
-                        yb_f = yb.float()
-                        if out.dim() > yb_f.dim():
-                            out_proc = out.squeeze(-1)
-                        else:
-                            out_proc = out
-                        loss = loss_fn(out_proc, yb_f)
-                        total_n += yb.numel()
-                        total_loss += loss.item() * yb.numel()
-                    except Exception:
-                        continue
-
-        metrics = {}
-        avg_loss = (total_loss / float(total_n)) if total_n > 0 else None
-        metrics['loss'] = float(avg_loss) if avg_loss is not None else None
-
-        if isinstance(loss_fn, nn.BCEWithLogitsLoss):
-            precision = (tp / (tp + fp)) if (tp + fp) > 0 else 0.0
-            recall = (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
-            accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
-            f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-            metrics.update({
-                "accuracy": float(accuracy),
-                "precision": float(precision),
-                "recall": float(recall),
-                "f1_score": float(f1)
-            })
-        elif isinstance(loss_fn, nn.CrossEntropyLoss):
-            class_ids = sorted(set(list(per_class_true.keys()) + list(per_class_pred.keys())))
-            precisions = []
-            recalls = []
-            f1s = []
-            total_correct = sum(per_class_tp.get(c, 0) for c in class_ids)
-            total_true = sum(per_class_true.values())
-            accuracy = total_correct / float(total_true) if total_true > 0 else 0.0
-            for c in class_ids:
-                tp_c = per_class_tp.get(c, 0)
-                pred_c = per_class_pred.get(c, 0)
-                true_c = per_class_true.get(c, 0)
-                p_c = tp_c / pred_c if pred_c > 0 else 0.0
-                r_c = tp_c / true_c if true_c > 0 else 0.0
-                f_c = (2 * p_c * r_c / (p_c + r_c)) if (p_c + r_c) > 0 else 0.0
-                precisions.append(p_c); recalls.append(r_c); f1s.append(f_c)
-            metrics.update({
-                "accuracy": float(accuracy),
-                "precision": float(np.mean(precisions)) if precisions else 0.0,
-                "recall": float(np.mean(recalls)) if recalls else 0.0,
-                "f1_score": float(np.mean(f1s)) if f1s else 0.0
-            })
-        else:
-            metrics.update({"accuracy": None, "precision": None, "recall": None, "f1_score": None})
-
-        def norm(v):
-            if v is None: return None
-            try: return float(v)
-            except: return v
-
-        metrics = {k: (norm(v) if not isinstance(v, (dict, list)) else v) for k,v in metrics.items()}
-
-        try:
-            atomic_write_json(args.metrics_json, metrics)
-            print("[eval] Wrote metrics to:", args.metrics_json)
-            print("[eval] Metrics:", metrics)
-        except Exception as e:
-            print("[eval] ERROR writing metrics:", e)
-            traceback.print_exc()
-            sys.exit(1)
+          try:
+              # write metrics to provided output path
+              ensure_parent_dir(args.metrics_json)
+              with open(args.metrics_json, "w") as f:
+                  json.dump(metrics, f, indent=2)
+              print(f"[eval] Successfully wrote metrics to: {args.metrics_json}", file=sys.stdout)
+          except Exception as e:
+              print("[eval] ERROR writing metrics JSON:", e, file=sys.stdout)
+              traceback.print_exc()
+              sys.exit(1)
     args:
-      - --test_loader
-      - {inputPath: test_loader}
-      - --model_config
-      - {inputValue: model_config}
       - --trained_model
-      - {inputPath: trained_model}
+      - { inputPath: trained_model }
+      - --test_loader
+      - { inputPath: test_loader }
+      - --config_json
+      - { inputPath: config_json }
       - --metrics_json
-      - {outputPath: metrics_json}
+      - { outputPath: metrics_json }
