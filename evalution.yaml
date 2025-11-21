@@ -1,4 +1,4 @@
-name: Evaluate LSTM v1
+name: Evaluate LSTM v2
 inputs:
   - {name: test_loader, type: Dataset}
   - {name: model_config, type: String}
@@ -13,13 +13,13 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, json, tempfile, tempfile, traceback, importlib
+        import argparse, os, sys, json, tempfile, traceback, importlib
         import torch
         import torch.nn as nn
         import numpy as np
         from torch.utils.data import TensorDataset, DataLoader
 
-        parser = argparse.ArgumentParser(description="Evaluate saved model on test_loader")
+        parser = argparse.ArgumentParser(description="Evaluate saved model on test_loader (auto-LSTM fallback)")
         parser.add_argument("--test_loader", required=True, help="Path to torch-saved test dataset / iterable")
         parser.add_argument("--model_config", required=False, default="", help="JSON string with eval config (optional)")
         parser.add_argument("--trained_model", required=True, help="Path to saved model object or checkpoint")
@@ -83,7 +83,6 @@ implementation:
                     return pickle.load(f)
 
         def try_instantiate_from_spec(spec_str, init_args):
-            # spec_str expected as "module.submodule:ClassName"
             if not spec_str:
                 return None
             try:
@@ -99,6 +98,29 @@ implementation:
             if hasattr(obj, '__iter__') and not isinstance(obj, dict):
                 return obj
             raise RuntimeError("Provided test object is not iterable - expected DataLoader/list/TensorDataset saved via torch.save")
+
+        # --- simple generic LSTM model used as fallback ---
+        class GenericLSTM(nn.Module):
+            def __init__(self, input_dim, hidden_dim=128, num_layers=1, dropout=0.0, output_dim=1, bidirectional=False):
+                super().__init__()
+                self.hidden_dim = hidden_dim
+                self.num_layers = num_layers
+                self.bidirectional = bidirectional
+                self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, batch_first=True, dropout=dropout, bidirectional=bidirectional)
+                lstm_out_dim = hidden_dim * (2 if bidirectional else 1)
+                self.head = nn.Sequential(
+                    nn.Flatten(),
+                    nn.Linear(lstm_out_dim, output_dim) if output_dim is not None else nn.Identity()
+                )
+            def forward(self, x):
+                # expect x shape: (B, T, input_dim) or (B, input_dim) (handle both)
+                if x.dim() == 2:
+                    # assume (B, input_dim) -> (B, 1, input_dim)
+                    x = x.unsqueeze(1)
+                out, _ = self.lstm(x)
+                # take last timestep
+                last = out[:, -1, :]
+                return self.head(last)
 
         # --- parse config ---
         eval_config = {}
@@ -124,13 +146,12 @@ implementation:
 
         model = None
         state_dict = None
+        ckpt_config = None
 
-        # If loaded object is an nn.Module instance -> use it directly
         if isinstance(trained_obj, nn.Module):
             model = trained_obj
             print("[eval] Loaded model instance directly.")
         elif isinstance(trained_obj, dict):
-            # common cases: {'model_state': ..., ...} or direct state_dict
             if 'model_state' in trained_obj:
                 state_dict = trained_obj['model_state']
                 print("[eval] Checkpoint contains 'model_state'.")
@@ -138,69 +159,96 @@ implementation:
                 state_dict = trained_obj['state_dict']
                 print("[eval] Checkpoint contains 'state_dict'.")
             else:
-                # might be a raw state_dict (keys look like param names)
-                # Heuristic: if keys are strings with '.' assume state_dict
+                # heuristic: raw state_dict (keys are strings with '.')
                 keys = list(trained_obj.keys())
                 if keys and isinstance(keys[0], str) and '.' in keys[0]:
                     state_dict = trained_obj
                     print("[eval] Loaded object looks like a raw state_dict.")
                 else:
-                    # maybe entire object wrapped; keep as dict (maybe contains model instance under key)
+                    # maybe a saved model under some key
                     for k in ('model','net','module'):
                         if k in trained_obj and isinstance(trained_obj[k], nn.Module):
                             model = trained_obj[k]
                             print(f"[eval] Found model instance under key '{k}'.")
                             break
+            # capture checkpoint config if present
+            for cfg_key in ('config','model_config','training_config'):
+                if cfg_key in trained_obj:
+                    ckpt_config = trained_obj[cfg_key]
+                    print(f"[eval] found checkpoint config under key '{cfg_key}'")
+                    break
         else:
             print("[eval] Loaded trained_model is of unexpected type:", type(trained_obj))
 
-        # If only state_dict present, try to instantiate model using model_class spec in model_config
+        # If we have only a state_dict, try to instantiate model using model_class spec in model_config
         if model is None and state_dict is not None:
             model_spec = eval_config.get('model_class', "")
             model_init_args = eval_config.get('model_init_args', {})
+
             if model_spec:
                 model_candidate = try_instantiate_from_spec(model_spec, model_init_args)
                 if model_candidate is not None:
                     model = model_candidate
-                    try:
-                        # strip module. prefix if needed
-                        new_state = {}
-                        for k, v in state_dict.items():
-                            if k.startswith('module.'):
-                                new_state[k.replace('module.', '', 1)] = v
-                            else:
-                                new_state[k] = v
-                        model.load_state_dict(new_state, strict=False)
-                        print("[eval] Loaded state_dict into instantiated model.")
-                    except Exception as e:
-                        print("[eval] Failed to load state_dict into instantiated model:", e)
-                        model = None
-                else:
-                    print("[eval] Could not instantiate model from model_class spec.")
+                    print("[eval] Instantiated model from provided model_class spec.")
             else:
-                print("[eval] No 'model_class' provided in model_config to reconstruct model from state_dict.")
+                # No model spec provided; try to auto-build using checkpoint config if available
+                auto_cfg = eval_config.copy()
+                if ckpt_config and isinstance(ckpt_config, dict):
+                    # merge ckpt_config but don't override explicit eval_config keys
+                    for k, v in ckpt_config.items():
+                        if k not in auto_cfg:
+                            auto_cfg[k] = v
+                    print("[eval] Merged checkpoint config into eval config for auto-instantiation.")
+                # Try to detect LSTM parameters in auto_cfg
+                try:
+                    inp = auto_cfg.get('processed_input_dim') or auto_cfg.get('input_dim') or auto_cfg.get('feature_dim') or auto_cfg.get('input_size')
+                    hidden = auto_cfg.get('hidden_dim') or auto_cfg.get('hidden_size') or auto_cfg.get('hidden')
+                    num_layers = auto_cfg.get('num_layers', auto_cfg.get('n_layers', 1))
+                    dropout = auto_cfg.get('dropout', 0.0)
+                    bidir = auto_cfg.get('bidirectional', False)
+                    out_dim = auto_cfg.get('output_dim') or auto_cfg.get('target_dim') or auto_cfg.get('output_size') or 1
+                    if inp is not None:
+                        # coerce to int
+                        input_dim = int(inp)
+                        hidden_dim = int(hidden) if hidden is not None else 128
+                        num_layers = int(num_layers) if num_layers is not None else 1
+                        dropout = float(dropout) if dropout is not None else 0.0
+                        out_dim = int(out_dim) if out_dim is not None else 1
+                        model = GenericLSTM(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, output_dim=out_dim, bidirectional=bool(bidir))
+                        print(f"[eval] Auto-instantiated GenericLSTM(input_dim={input_dim}, hidden_dim={hidden_dim}, num_layers={num_layers}, dropout={dropout}, output_dim={out_dim})")
+                    else:
+                        print("[eval] Auto-instantiation skipped: could not find input_dim in model_config or checkpoint config.")
+                except Exception as e:
+                    print("[eval] Auto-instantiation failed:", e)
 
-        if model is None and state_dict is None:
-            # last resort: maybe the file was a checkpoint with a serialized model under some key (search)
-            if isinstance(trained_obj, dict):
-                for k, v in trained_obj.items():
-                    if isinstance(v, nn.Module):
-                        model = v
-                        print(f"[eval] Found model instance under key '{k}'.")
-                        break
-
+        # If we have a model instance and a state_dict, load it (strip 'module.' prefix if needed)
+        if model is not None and state_dict is not None:
+            try:
+                new_state = {}
+                for k, v in state_dict.items():
+                    if k.startswith('module.'):
+                        new_state[k.replace('module.', '', 1)] = v
+                    else:
+                        new_state[k] = v
+                model.load_state_dict(new_state, strict=False)
+                print("[eval] Loaded state_dict into model (strict=False).")
+            except Exception as e:
+                print("[eval] Failed to load state_dict into model:", e)
+                traceback.print_exc()
+                # allow continuing only if model already had weights
+        # If model still None -> error
         if model is None:
             print("[eval] ERROR: unable to obtain a torch.nn.Module instance for evaluation.")
             print("Either provide a saved model instance (torch.save(model, path)) as trained_model,")
             print("or include 'model_class' (module:ClassName) and 'model_init_args' in model_config so the checkpoint state_dict can be loaded.")
             sys.exit(1)
 
-        # --- finalize device and move model ---
+        # finalize device
         device = torch.device(device_req) if device_req else (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
         model.to(device)
         model.eval()
 
-        # --- load test loader ---
+        # load test loader
         try:
             test_obj = load_torch_obj(args.test_loader)
             test_iter = iterable_from(test_obj)
@@ -209,7 +257,7 @@ implementation:
             traceback.print_exc()
             sys.exit(1)
 
-        # --- pick loss function ---
+        # pick loss function
         if loss_name.lower().startswith('bce'):
             loss_fn = nn.BCEWithLogitsLoss()
             is_binary = True
@@ -223,14 +271,9 @@ implementation:
             loss_fn = nn.BCEWithLogitsLoss()
             is_binary = True
 
-        # metrics accumulators
         total_loss = 0.0
         total_n = 0
-        tp = 0
-        fp = 0
-        tn = 0
-        fn = 0
-        # For multiclass: compute accuracy only; precision/recall/f1 computed with macro averaging
+        tp = fp = tn = fn = 0
         per_class_tp = {}
         per_class_pred = {}
         per_class_true = {}
@@ -240,15 +283,11 @@ implementation:
                 try:
                     xb, yb = batch
                 except Exception:
-                    # try if single tensor (features only)
                     continue
                 xb = xb.to(device).float()
                 yb = yb.to(device)
                 out = model(xb)
-                # handle shapes
-                # if BCEWithLogitsLoss and single output, out may be (B,1) or (B,)
                 if isinstance(loss_fn, nn.BCEWithLogitsLoss):
-                    # ensure yb is float
                     yb_f = yb.float()
                     if out.dim() > yb_f.dim():
                         out_proc = out.squeeze(-1)
@@ -258,7 +297,6 @@ implementation:
                     probs = torch.sigmoid(out_proc)
                     preds = (probs >= threshold).long()
                     trues = yb.long()
-                    # accumulate binary counts
                     for p, t in zip(preds.view(-1).cpu().numpy(), trues.view(-1).cpu().numpy()):
                         if p == 1 and t == 1:
                             tp += 1
@@ -271,20 +309,17 @@ implementation:
                     total_n += yb.numel()
                     total_loss += loss.item() * yb.numel()
                 elif isinstance(loss_fn, nn.CrossEntropyLoss):
-                    # out: (B, C); yb: (B,) with class indices
                     loss = loss_fn(out, yb.long())
                     preds = torch.argmax(out, dim=1)
                     trues = yb.long()
                     total_n += yb.size(0)
                     total_loss += loss.item() * yb.size(0)
-                    # per-class counts
                     for p, t in zip(preds.cpu().numpy(), trues.cpu().numpy()):
                         per_class_pred[p] = per_class_pred.get(p, 0) + 1
                         per_class_true[t] = per_class_true.get(t, 0) + 1
                         if p == t:
                             per_class_tp[p] = per_class_tp.get(p, 0) + 1
                 else:
-                    # fallback: treat as regression or single-output
                     try:
                         yb_f = yb.float()
                         if out.dim() > yb_f.dim():
@@ -294,38 +329,30 @@ implementation:
                         loss = loss_fn(out_proc, yb_f)
                         total_n += yb.numel()
                         total_loss += loss.item() * yb.numel()
-                    except Exception as e:
-                        # cannot handle this batch
+                    except Exception:
                         continue
 
-        # compute final metrics
         metrics = {}
-        if total_n > 0:
-            avg_loss = total_loss / float(total_n)
-        else:
-            avg_loss = None
-        metrics['loss'] = avg_loss if avg_loss is not None else None
+        avg_loss = (total_loss / float(total_n)) if total_n > 0 else None
+        metrics['loss'] = float(avg_loss) if avg_loss is not None else None
 
         if isinstance(loss_fn, nn.BCEWithLogitsLoss):
-            # binary metrics
             precision = (tp / (tp + fp)) if (tp + fp) > 0 else 0.0
             recall = (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
             accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
             f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
             metrics.update({
-                "accuracy": accuracy,
-                "precision": precision,
-                "recall": recall,
-                "f1_score": f1
+                "accuracy": float(accuracy),
+                "precision": float(precision),
+                "recall": float(recall),
+                "f1_score": float(f1)
             })
         elif isinstance(loss_fn, nn.CrossEntropyLoss):
-            # compute macro precision/recall/f1 from per_class counts
             class_ids = sorted(set(list(per_class_true.keys()) + list(per_class_pred.keys())))
             precisions = []
             recalls = []
             f1s = []
             total_correct = sum(per_class_tp.get(c, 0) for c in class_ids)
-            total_pred = sum(per_class_pred.values())
             total_true = sum(per_class_true.values())
             accuracy = total_correct / float(total_true) if total_true > 0 else 0.0
             for c in class_ids:
@@ -335,37 +362,22 @@ implementation:
                 p_c = tp_c / pred_c if pred_c > 0 else 0.0
                 r_c = tp_c / true_c if true_c > 0 else 0.0
                 f_c = (2 * p_c * r_c / (p_c + r_c)) if (p_c + r_c) > 0 else 0.0
-                precisions.append(p_c)
-                recalls.append(r_c)
-                f1s.append(f_c)
-            precision = float(np.mean(precisions)) if precisions else 0.0
-            recall = float(np.mean(recalls)) if recalls else 0.0
-            f1 = float(np.mean(f1s)) if f1s else 0.0
+                precisions.append(p_c); recalls.append(r_c); f1s.append(f_c)
             metrics.update({
                 "accuracy": float(accuracy),
-                "precision": float(precision),
-                "recall": float(recall),
-                "f1_score": float(f1)
+                "precision": float(np.mean(precisions)) if precisions else 0.0,
+                "recall": float(np.mean(recalls)) if recalls else 0.0,
+                "f1_score": float(np.mean(f1s)) if f1s else 0.0
             })
         else:
-            # regression / fallback: report loss and NaNs for classification metrics
-            metrics.update({
-                "accuracy": None,
-                "precision": None,
-                "recall": None,
-                "f1_score": None
-            })
+            metrics.update({"accuracy": None, "precision": None, "recall": None, "f1_score": None})
 
-        # ensure floats are regular python floats
         def norm(v):
-            if v is None:
-                return None
-            try:
-                return float(v)
-            except:
-                return v
+            if v is None: return None
+            try: return float(v)
+            except: return v
 
-        metrics = {k: (norm(v) if not isinstance(v, (dict, list)) else v) for k, v in metrics.items()}
+        metrics = {k: (norm(v) if not isinstance(v, (dict, list)) else v) for k,v in metrics.items()}
 
         try:
             atomic_write_json(args.metrics_json, metrics)
