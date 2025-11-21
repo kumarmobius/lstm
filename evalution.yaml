@@ -1,9 +1,4 @@
 name: Eval RNN Model v3
-description: |
-  Evaluates an RNN model using the LSTM class from nesy_factory.RNNs.
-  Loads model_state from checkpoint, loads external config JSON (provided as input),
-  runs BaseRNN.eval_step, and saves evaluation metrics as JSON.
-
 inputs:
   - name: trained_model
     type: Model
@@ -221,4 +216,4 @@ implementation:
       - --config_json
       - { inputPath: config_json }
       - --metrics_json
-      - { outputPath: metrics_json }
+      - { inputValue: metrics_json }
