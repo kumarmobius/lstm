@@ -1,13 +1,4 @@
-name: Eval RNN Model v10
-description: |
-  Robust evaluator for LSTM (nesy_factory.RNNs.LSTM).
-  - Accepts external config (file path or raw JSON string).
-  - Loads checkpoint (torch.load with pickle fallback).
-  - Instantiates LSTM(config) and loads weights.
-  - Runs a controlled evaluation loop that converts logits/outputs and labels
-    into the correct forms before computing classification metrics.
-  - Writes metrics JSON to output path atomically.
-
+name: Eval LSTM
 inputs:
   - name: trained_model
     type: Model
@@ -23,7 +14,7 @@ inputs:
 
 outputs:
   - name: metrics_json
-    type: Metrics
+    type: String
     description: "Evaluation metrics saved as JSON"
 
 implementation:
