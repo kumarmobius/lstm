@@ -97,7 +97,7 @@ implementation:
                       return obj
                   except Exception as e_pickle:
                       print("[eval] pickle.load also failed:", repr(e_pickle), file=sys.stdout)
-                      raise RuntimeError(f"Failed to load file: {actual}\n torch_error: {e_torch}\n pickle_error: {e_pickle}")
+                      raise RuntimeError(f"Failed to load file: {actual} torch_error: {e_torch} pickle_error: {e_pickle}")
 
           def parse_config_input(config_input):
               try:
