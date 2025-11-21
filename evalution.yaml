@@ -1,10 +1,12 @@
-name: Eval RNN Model v9
+name: Eval RNN Model v10
 description: |
-  Evaluates an RNN model using the LSTM class from nesy_factory.RNNs.
-  Accepts external config as either a file path or a raw JSON string.
-  Auto-fills missing 'input_dim' and 'output_dim' from common config keys or sensible defaults.
-  Loads model_state from checkpoint (torch.load, falls back to pickle.load), instantiates LSTM(config),
-  runs BaseRNN.eval_step, and writes metrics JSON.
+  Robust evaluator for LSTM (nesy_factory.RNNs.LSTM).
+  - Accepts external config (file path or raw JSON string).
+  - Loads checkpoint (torch.load with pickle fallback).
+  - Instantiates LSTM(config) and loads weights.
+  - Runs a controlled evaluation loop that converts logits/outputs and labels
+    into the correct forms before computing classification metrics.
+  - Writes metrics JSON to output path atomically.
 
 inputs:
   - name: trained_model
@@ -32,14 +34,9 @@ implementation:
       - -u
       - -c
       - |
-          import argparse
-          import json
-          import os
-          import sys
-          import traceback
-          import tempfile
-          import torch
-          import pickle
+          import argparse, json, os, sys, traceback, tempfile
+          import torch, pickle, math
+          import numpy as np
 
           def ensure_parent_dir(path):
               parent = os.path.dirname(path)
@@ -88,18 +85,19 @@ implementation:
               print(f"[eval] Loading object from: {actual}", file=sys.stdout)
               try:
                   obj = torch.load(actual, map_location="cpu")
-                  print(f"[eval] torch.load succeeded for: {actual}", file=sys.stdout)
+                  print("[eval] torch.load succeeded for:", actual, file=sys.stdout)
                   return obj
               except Exception as e_torch:
-                  print(f"[eval] torch.load failed: {e_torch!r}. Attempting pickle.load fallback...", file=sys.stdout)
+                  print("[eval] torch.load failed:", repr(e_torch), file=sys.stdout)
+                  print("[eval] Attempting pickle.load fallback...", file=sys.stdout)
                   try:
                       with open(actual, "rb") as f:
                           obj = pickle.load(f)
-                      print(f"[eval] pickle.load succeeded for: {actual}", file=sys.stdout)
+                      print("[eval] pickle.load succeeded for:", actual, file=sys.stdout)
                       return obj
                   except Exception as e_pickle:
-                      print(f"[eval] pickle.load also failed: {e_pickle!r}", file=sys.stdout)
-                      raise RuntimeError(f"Failed to load file with torch and pickle: {actual} torch_error: {e_torch} pickle_error: {e_pickle}")
+                      print("[eval] pickle.load also failed:", repr(e_pickle), file=sys.stdout)
+                      raise RuntimeError(f"Failed to load file: {actual}\n torch_error: {e_torch}\n pickle_error: {e_pickle}")
 
           def parse_config_input(config_input):
               try:
@@ -113,72 +111,48 @@ implementation:
               except Exception as e:
                   raise ValueError(f"config_json is neither a valid file path nor a valid JSON string: {e}")
 
-          parser = argparse.ArgumentParser(description="Evaluate LSTM model using nesy_factory.RNNs.LSTM (auto-fill dims)")
-          parser.add_argument("--trained_model", required=True, help="Path to trained model checkpoint (file/dir)")
-          parser.add_argument("--test_loader", required=True, help="Path to torch-saved or pickle-saved test DataLoader/iterable")
-          parser.add_argument("--config_json", required=True, help="Path to JSON file or raw JSON string with model config")
-          parser.add_argument("--metrics_json", required=True, help="Output path for metrics JSON (file)")
+          parser = argparse.ArgumentParser(description="Robust Eval LSTM")
+          parser.add_argument("--trained_model", required=True)
+          parser.add_argument("--test_loader", required=True)
+          parser.add_argument("--config_json", required=True, help="Path or raw JSON string")
+          parser.add_argument("--metrics_json", required=True)
           args = parser.parse_args()
 
           print("[eval] Args:", args, file=sys.stdout)
 
           try:
-              # 1) parse config
-              print(f"[eval] Parsing config input...", file=sys.stdout)
               config = parse_config_input(args.config_json)
-              print("[eval] Config keys initially:", list(config.keys()), file=sys.stdout)
+              print("[eval] Parsed config keys:", list(config.keys()), file=sys.stdout)
 
-              # Auto-fill input_dim if missing
+              # ensure input_dim
               if "input_dim" not in config:
-                  filled = False
                   if "processed_input_dim" in config:
                       config["input_dim"] = int(config["processed_input_dim"])
-                      filled = True
-                  elif "input_size" in config:
-                      config["input_dim"] = int(config["input_size"])
-                      filled = True
+                      print("[eval] auto-filled input_dim from processed_input_dim:", config["input_dim"], file=sys.stdout)
                   elif "feature_columns" in config and isinstance(config["feature_columns"], (list, tuple)):
                       config["input_dim"] = int(len(config["feature_columns"]))
-                      filled = True
-                  if filled:
-                      print(f"[eval] Auto-filled config['input_dim'] = {config['input_dim']}", file=sys.stdout)
+                      print("[eval] auto-filled input_dim from feature_columns length:", config["input_dim"], file=sys.stdout)
                   else:
-                      raise KeyError("Missing required 'input_dim' in config. Provide one of: 'input_dim', 'processed_input_dim', 'input_size', or 'feature_columns'.")
+                      raise KeyError("Missing 'input_dim' in config. Provide input_dim or processed_input_dim or feature_columns.")
 
-              # Auto-fill output_dim if missing
+              # ensure output_dim
               if "output_dim" not in config:
-                  filled_out = False
-                  loss_fn = str(config.get("loss_function", "")).lower()
+                  loss_fn = str(config.get("loss_function","")).lower()
                   if "bce" in loss_fn or "binary" in loss_fn:
                       config["output_dim"] = 1
-                      filled_out = True
+                      print("[eval] auto-filled output_dim = 1 (binary)", file=sys.stdout)
                   elif "num_classes" in config:
                       config["output_dim"] = int(config["num_classes"])
-                      filled_out = True
-                  elif "n_classes" in config:
-                      config["output_dim"] = int(config["n_classes"])
-                      filled_out = True
-                  elif "target_dim" in config:
-                      config["output_dim"] = int(config["target_dim"])
-                      filled_out = True
-                  elif "output_size" in config:
-                      config["output_dim"] = int(config["output_size"])
-                      filled_out = True
-                  if filled_out:
-                      print(f"[eval] Auto-filled config['output_dim'] = {config['output_dim']}", file=sys.stdout)
+                      print("[eval] auto-filled output_dim from num_classes", file=sys.stdout)
                   else:
-                      # default to 1 for binary classification; warn loudly
                       config["output_dim"] = 1
-                      print("[eval] WARNING: 'output_dim' missing in config and could not be inferred. Defaulting to output_dim = 1 (binary). If your task is multi-class/regression, set 'output_dim' explicitly in config.", file=sys.stdout)
+                      print("[eval] defaulted output_dim = 1", file=sys.stdout)
 
-              print("[eval] Final config keys (after autofill):", list(config.keys()), file=sys.stdout)
-              print("[eval] Final config snippet:", {k: config[k] for k in ("input_dim","output_dim","loss_function") if k in config}, file=sys.stdout)
+              # threshold for binary predictions (config override allowed)
+              threshold = float(config.get("threshold", 0.5))
 
-              # 2) load checkpoint (torch.load with pickle fallback)
-              print(f"[eval] Resolving and loading checkpoint: {args.trained_model}", file=sys.stdout)
+              # load checkpoint
               checkpoint = load_with_fallback(args.trained_model)
-              print(f"[eval] checkpoint loaded type: {type(checkpoint)}", file=sys.stdout)
-
               model_state = None
               model_instance = None
               if isinstance(checkpoint, dict):
@@ -191,68 +165,232 @@ implementation:
                       if keys and isinstance(keys[0], str) and '.' in keys[0]:
                           model_state = checkpoint
                       else:
-                          for k in ("model", "net", "module"):
+                          for k in ("model","net","module"):
                               if k in checkpoint and hasattr(checkpoint[k], "__class__"):
                                   model_instance = checkpoint[k]
                                   break
               else:
                   model_instance = checkpoint
 
-              # 3) import LSTM and instantiate with provided config
-              print("[eval] Importing LSTM from nesy_factory.RNNs ...", file=sys.stdout)
+              # import LSTM and create model
               from nesy_factory.RNNs import LSTM
+              model = LSTM(config)
 
-              print("[eval] Instantiating LSTM with provided config ...", file=sys.stdout)
-              model = LSTM(config)  # input_dim and output_dim guaranteed
-
-              # load weights if available
+              # load weights if present
               if model_instance is not None:
                   try:
                       model.load_state_dict(model_instance.state_dict(), strict=False)
-                      print("[eval] Loaded weights from model instance in checkpoint.", file=sys.stdout)
+                      print("[eval] Loaded state from saved model instance", file=sys.stdout)
                   except Exception as e:
-                      print("[eval] Warning: could not load weights from saved model instance:", e, file=sys.stdout)
+                      print("[eval] Warning loading from model instance:", e, file=sys.stdout)
               elif model_state is not None:
                   new_state = {}
-                  for k, v in model_state.items():
+                  for k,v in model_state.items():
                       if isinstance(k, str) and k.startswith("module."):
-                          new_state[k.replace("module.", "", 1)] = v
+                          new_state[k.replace("module.","",1)] = v
                       else:
                           new_state[k] = v
                   try:
                       model.load_state_dict(new_state, strict=False)
-                      print("[eval] Loaded state_dict into model (strict=False).", file=sys.stdout)
+                      print("[eval] Loaded state_dict into model", file=sys.stdout)
                   except Exception as e:
-                      print("[eval] Warning: loading state_dict failed:", e, file=sys.stdout)
+                      print("[eval] Warning loading state_dict:", e, file=sys.stdout)
               else:
-                  print("[eval] Warning: no model state found in checkpoint; continuing with fresh model init.", file=sys.stdout)
+                  print("[eval] No model weights found; using fresh model instance", file=sys.stdout)
 
-              # ensure optimizer & criterion exist
-              try:
-                  model._init_optimizer_and_criterion()
-              except Exception as e:
-                  print("[eval] Warning: model._init_optimizer_and_criterion() failed:", e, file=sys.stdout)
+              # ensure loss function
+              loss_name = str(config.get("loss_function","")).lower()
+              if "bce" in loss_name:
+                  loss_fn = torch.nn.BCEWithLogitsLoss()
+                  is_binary = True
+              elif "cross" in loss_name:
+                  loss_fn = torch.nn.CrossEntropyLoss()
+                  is_binary = False
+              elif "mse" in loss_name or "mse" == loss_name:
+                  loss_fn = torch.nn.MSELoss()
+                  is_binary = False
+              else:
+                  # default to BCE for safety if output_dim==1
+                  if config.get("output_dim",1) == 1:
+                      loss_fn = torch.nn.BCEWithLogitsLoss(); is_binary = True
+                  else:
+                      loss_fn = torch.nn.MSELoss(); is_binary = False
 
-              # 4) load test loader
-              print(f"[eval] Resolving and loading test_loader: {args.test_loader}", file=sys.stdout)
+              device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+              model.to(device)
+              model.eval()
+
+              # load test loader
               test_obj = load_with_fallback(args.test_loader)
-              print(f"[eval] test object loaded type: {type(test_obj)}", file=sys.stdout)
+              print("[eval] test object type:", type(test_obj), file=sys.stdout)
 
-              # 5) run evaluation
-              print("[eval] Running eval_step() ...", file=sys.stdout)
-              metrics = model.eval_step(test_obj)
+              # iterate and collect preds and labels
+              all_logits = []
+              all_probs = []
+              all_preds = []
+              all_labels = []
+              total_loss = 0.0
+              total_n = 0
 
-              # normalize to native python floats when possible
-              def _norm(v):
-                  if v is None:
-                      return None
+              with torch.no_grad():
+                  for batch in test_obj:
+                      try:
+                          xb, yb = batch
+                      except Exception:
+                          # unsupported batch form
+                          continue
+                      xb = xb.to(device).float()
+                      yb_cpu = yb.detach().cpu()
+                      # forward
+                      out = model(xb)
+                      out_cpu = out.detach().cpu()
+                      # compute loss (match shapes)
+                      try:
+                          # adapt shapes
+                          if isinstance(loss_fn, torch.nn.BCEWithLogitsLoss):
+                              yb_t = yb_cpu.float()
+                              if out_cpu.dim() > yb_t.dim():
+                                  out_proc = out_cpu.squeeze(-1)
+                              else:
+                                  out_proc = out_cpu
+                              loss = loss_fn(out_proc, yb_t.to(out_proc.dtype))
+                          elif isinstance(loss_fn, torch.nn.CrossEntropyLoss):
+                              loss = loss_fn(out_cpu, yb_cpu.long())
+                          else:
+                              # regression
+                              yb_t = yb_cpu.float()
+                              if out_cpu.dim() > yb_t.dim():
+                                  out_proc = out_cpu.squeeze(-1)
+                              else:
+                                  out_proc = out_cpu
+                              loss = loss_fn(out_proc, yb_t.to(out_proc.dtype))
+                      except Exception as e:
+                          loss = 0.0
+                          print("[eval] Warning: loss compute failed for batch:", e, file=sys.stdout)
+
+                      # collect
+                      batch_n = int(np.prod(yb_cpu.shape))
+                      total_loss += float(loss) * batch_n
+                      total_n += batch_n
+
+                      # Build labels array in 1D form
+                      yb_arr = yb_cpu.numpy()
+                      # if one-hot, convert to indices
+                      if yb_arr.ndim > 1 and yb_arr.shape[1] > 1:
+                          yb_proc = np.argmax(yb_arr, axis=1)
+                      else:
+                          yb_proc = yb_arr.reshape(-1)
+
+                      # predictions handling
+                      if is_binary:
+                          # logits -> probs -> threshold -> binary preds
+                          # ensure out_cpu is 1D
+                          if out_cpu.dim() > 1 and out_cpu.shape[1] == 1:
+                              logits = out_cpu.view(-1).numpy()
+                          elif out_cpu.dim() == 2 and out_cpu.shape[1] > 1:
+                              # multi-output - reduce? take first column (best-effort)
+                              logits = out_cpu[:,0].numpy()
+                          else:
+                              logits = out_cpu.reshape(-1).numpy()
+                          probs = 1.0 / (1.0 + np.exp(-logits))
+                          preds = (probs >= threshold).astype(int)
+                      else:
+                          # multiclass/regression: if out dimension >1 treat as class logits
+                          if out_cpu.dim() == 2 and out_cpu.shape[1] > 1:
+                              probs_arr = torch.softmax(out_cpu, dim=1).numpy()
+                              preds = np.argmax(probs_arr, axis=1)
+                              probs = np.max(probs_arr, axis=1)
+                              logits = None
+                          else:
+                              # regression numeric output
+                              preds = out_cpu.reshape(-1).numpy()
+                              probs = preds.copy()
+                              logits = preds.copy()
+
+                      # append
+                      all_labels.append(yb_proc)
+                      all_preds.append(preds)
+                      all_probs.append(probs)
+                      if 'logits' in locals() and logits is not None:
+                          all_logits.append(logits)
+
+              if total_n > 0:
+                  avg_loss = total_loss / float(total_n)
+              else:
+                  avg_loss = None
+
+              if len(all_labels) == 0:
+                  raise RuntimeError("No evaluation samples found in test_loader.")
+
+              y_all = np.concatenate(all_labels).ravel()
+              p_all = np.concatenate(all_preds).ravel()
+              prob_all = np.concatenate(all_probs).ravel()
+
+              # normalize labels to integers when appropriate
+              # if labels are floats in [0,1], convert via threshold 0.5
+              if set(np.unique(y_all)).issubset(set([0.0,1.0])) or set(np.unique(y_all)).issubset(set([0,1])):
+                  label_is_binary = True
+              else:
+                  label_is_binary = False
+
+              # If label is float continuous but predictions binary -> try to coerce labels
+              if label_is_binary and (prob_all.dtype.kind in 'f'):
+                  # OK
+                  pass
+
+              # compute metrics
+              metrics = {"loss": float(avg_loss) if avg_loss is not None else None}
+
+              # try sklearn, otherwise fallback
+              try:
+                  from sklearn.metrics import precision_recall_fscore_support, accuracy_score, roc_auc_score
+                  if is_binary:
+                      precision, recall, f1, _ = precision_recall_fscore_support(y_all.astype(int), p_all.astype(int), average='binary', zero_division=0)
+                      accuracy = float(accuracy_score(y_all.astype(int), p_all.astype(int)))
+                      metrics.update({"accuracy": accuracy, "precision": float(precision), "recall": float(recall), "f1_score": float(f1)})
+                      # try auc if labels contain both classes
+                      try:
+                          if len(np.unique(y_all)) > 1:
+                              auc = float(roc_auc_score(y_all.astype(int), prob_all))
+                              metrics["roc_auc"] = auc
+                      except Exception as e:
+                          print("[eval] AUC compute failed:", e, file=sys.stdout)
+                  else:
+                      # multiclass / regression: try macro averaging if preds are discrete
+                      if p_all.dtype.kind in 'f' and np.all(np.mod(p_all,1)==0):
+                          p_all_int = p_all.astype(int)
+                          precision, recall, f1, _ = precision_recall_fscore_support(y_all.astype(int), p_all_int, average='macro', zero_division=0)
+                          accuracy = float(accuracy_score(y_all.astype(int), p_all_int))
+                          metrics.update({"accuracy": accuracy, "precision": float(precision), "recall": float(recall), "f1_score": float(f1)})
+                      else:
+                          # regression metrics fallback
+                          mse = float(((prob_all - y_all.astype(float))**2).mean())
+                          mae = float(np.mean(np.abs(prob_all - y_all.astype(float))))
+                          metrics.update({"mse": mse, "mae": mae})
+              except Exception as e_sk:
+                  print("[eval] sklearn metrics failed or unavailable:", e_sk, file=sys.stdout)
+                  # manual safe computations
                   try:
-                      return float(v)
-                  except Exception:
-                      return v
-              metrics = {k: (_norm(v) if not isinstance(v, (dict, list)) else v) for k, v in metrics.items()}
+                      yb_int = y_all.astype(int)
+                      p_int = p_all.astype(int)
+                      tp = int(((p_int==1) & (yb_int==1)).sum())
+                      fp = int(((p_int==1) & (yb_int==0)).sum())
+                      tn = int(((p_int==0) & (yb_int==0)).sum())
+                      fn = int(((p_int==0) & (yb_int==1)).sum())
+                      precision = tp / (tp+fp) if (tp+fp)>0 else 0.0
+                      recall = tp / (tp+fn) if (tp+fn)>0 else 0.0
+                      acc = (tp+tn) / max(1, (tp+tn+fp+fn))
+                      f1 = (2*precision*recall/(precision+recall)) if (precision+recall)>0 else 0.0
+                      metrics.update({"accuracy": float(acc), "precision": float(precision), "recall": float(recall), "f1_score": float(f1)})
+                  except Exception as e2:
+                      print("[eval] Fallback manual metric computation failed:", e2, file=sys.stdout)
+                      metrics.update({"error": "metrics computation failed"})
 
-              print("[eval] Metrics computed:", metrics, file=sys.stdout)
+              print("[eval] Final metrics:", metrics, file=sys.stdout)
+
+              # write metrics
+              atomic_write_json(args.metrics_json, metrics)
+              print("[eval] Wrote metrics to:", args.metrics_json, file=sys.stdout)
 
           except Exception as e:
               print("[eval] ERROR during setup/eval:", e, file=sys.stdout)
@@ -263,16 +401,6 @@ implementation:
                       json.dump({"error": str(e)}, f)
               except Exception:
                   pass
-              sys.exit(1)
-
-          # 6) write metrics JSON atomically
-          try:
-              print(f"[eval] Writing metrics to: {args.metrics_json}", file=sys.stdout)
-              atomic_write_json(args.metrics_json, metrics)
-              print("[eval] Successfully wrote metrics.", file=sys.stdout)
-          except Exception as e:
-              print("[eval] ERROR writing metrics JSON:", e, file=sys.stdout)
-              traceback.print_exc()
               sys.exit(1)
     args:
       - --trained_model
