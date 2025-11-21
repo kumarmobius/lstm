@@ -1,4 +1,11 @@
-name: Eval RNN Model v8.1
+name: Eval RNN Model v9
+description: |
+  Evaluates an RNN model using the LSTM class from nesy_factory.RNNs.
+  Accepts external config as either a file path or a raw JSON string.
+  Auto-fills missing 'input_dim' and 'output_dim' from common config keys or sensible defaults.
+  Loads model_state from checkpoint (torch.load, falls back to pickle.load), instantiates LSTM(config),
+  runs BaseRNN.eval_step, and writes metrics JSON.
+
 inputs:
   - name: trained_model
     type: Model
@@ -95,20 +102,18 @@ implementation:
                       raise RuntimeError(f"Failed to load file with torch and pickle: {actual} torch_error: {e_torch} pickle_error: {e_pickle}")
 
           def parse_config_input(config_input):
-              # If it's a file path
               try:
                   if os.path.exists(config_input):
                       with open(config_input, "r") as f:
                           return json.load(f)
               except Exception:
                   pass
-              # Try to parse as JSON string
               try:
                   return json.loads(config_input)
               except Exception as e:
                   raise ValueError(f"config_json is neither a valid file path nor a valid JSON string: {e}")
 
-          parser = argparse.ArgumentParser(description="Evaluate LSTM model using nesy_factory.RNNs.LSTM (auto-fill input_dim)")
+          parser = argparse.ArgumentParser(description="Evaluate LSTM model using nesy_factory.RNNs.LSTM (auto-fill dims)")
           parser.add_argument("--trained_model", required=True, help="Path to trained model checkpoint (file/dir)")
           parser.add_argument("--test_loader", required=True, help="Path to torch-saved or pickle-saved test DataLoader/iterable")
           parser.add_argument("--config_json", required=True, help="Path to JSON file or raw JSON string with model config")
@@ -135,14 +140,39 @@ implementation:
                   elif "feature_columns" in config and isinstance(config["feature_columns"], (list, tuple)):
                       config["input_dim"] = int(len(config["feature_columns"]))
                       filled = True
-                  elif "input_dim" in config:  # redundant, defensive
-                      config["input_dim"] = int(config["input_dim"])
-                      filled = True
-
                   if filled:
                       print(f"[eval] Auto-filled config['input_dim'] = {config['input_dim']}", file=sys.stdout)
                   else:
                       raise KeyError("Missing required 'input_dim' in config. Provide one of: 'input_dim', 'processed_input_dim', 'input_size', or 'feature_columns'.")
+
+              # Auto-fill output_dim if missing
+              if "output_dim" not in config:
+                  filled_out = False
+                  loss_fn = str(config.get("loss_function", "")).lower()
+                  if "bce" in loss_fn or "binary" in loss_fn:
+                      config["output_dim"] = 1
+                      filled_out = True
+                  elif "num_classes" in config:
+                      config["output_dim"] = int(config["num_classes"])
+                      filled_out = True
+                  elif "n_classes" in config:
+                      config["output_dim"] = int(config["n_classes"])
+                      filled_out = True
+                  elif "target_dim" in config:
+                      config["output_dim"] = int(config["target_dim"])
+                      filled_out = True
+                  elif "output_size" in config:
+                      config["output_dim"] = int(config["output_size"])
+                      filled_out = True
+                  if filled_out:
+                      print(f"[eval] Auto-filled config['output_dim'] = {config['output_dim']}", file=sys.stdout)
+                  else:
+                      # default to 1 for binary classification; warn loudly
+                      config["output_dim"] = 1
+                      print("[eval] WARNING: 'output_dim' missing in config and could not be inferred. Defaulting to output_dim = 1 (binary). If your task is multi-class/regression, set 'output_dim' explicitly in config.", file=sys.stdout)
+
+              print("[eval] Final config keys (after autofill):", list(config.keys()), file=sys.stdout)
+              print("[eval] Final config snippet:", {k: config[k] for k in ("input_dim","output_dim","loss_function") if k in config}, file=sys.stdout)
 
               # 2) load checkpoint (torch.load with pickle fallback)
               print(f"[eval] Resolving and loading checkpoint: {args.trained_model}", file=sys.stdout)
@@ -151,7 +181,6 @@ implementation:
 
               model_state = None
               model_instance = None
-              # Determine what's inside checkpoint
               if isinstance(checkpoint, dict):
                   if "model_state" in checkpoint:
                       model_state = checkpoint["model_state"]
@@ -174,7 +203,7 @@ implementation:
               from nesy_factory.RNNs import LSTM
 
               print("[eval] Instantiating LSTM with provided config ...", file=sys.stdout)
-              model = LSTM(config)  # now input_dim guaranteed
+              model = LSTM(config)  # input_dim and output_dim guaranteed
 
               # load weights if available
               if model_instance is not None:
@@ -228,7 +257,6 @@ implementation:
           except Exception as e:
               print("[eval] ERROR during setup/eval:", e, file=sys.stdout)
               traceback.print_exc()
-              # attempt to write an error JSON to outputs for debugging
               try:
                   ensure_parent_dir(args.metrics_json)
                   with open(args.metrics_json, "w") as f:
