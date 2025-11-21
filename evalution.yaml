@@ -1,8 +1,14 @@
-name: Eval RNN Model v5
+name: Eval RNN Model v6
+description: |
+  Evaluates an RNN model using the LSTM class from nesy_factory.RNNs.
+  Accepts external config as either a file path or a raw JSON string.
+  Loads model_state from checkpoint, instantiates LSTM(config), runs BaseRNN.eval_step,
+  and writes metrics JSON to the provided output path.
+
 inputs:
   - name: trained_model
     type: Model
-    description: "Trained model checkpoint containing model_state (torch-saved file or folder)"
+    description: "Trained model checkpoint (torch-saved file or directory containing 'data')"
 
   - name: test_loader
     type: Dataset
@@ -10,7 +16,7 @@ inputs:
 
   - name: config_json
     type: String
-    description: "JSON file containing model config for instantiating LSTM (external input)"
+    description: "Either a path to a JSON file or a raw JSON string containing model config"
 
 outputs:
   - name: metrics_json
@@ -30,8 +36,8 @@ implementation:
           import os
           import sys
           import traceback
-          import torch
           import tempfile
+          import torch
 
           def ensure_parent_dir(path):
               parent = os.path.dirname(path)
@@ -53,93 +59,126 @@ implementation:
                       pass
                   raise
 
+          def find_actual_file(path):
+              """
+              Resolve common artifact shapes:
+              - if path is a file -> return it
+              - if path is a directory and contains 'data' file -> return that
+              - else walk and choose a candidate file (prefer .pth/.pt/.pkl/.bin)
+              """
+              if os.path.isfile(path):
+                  return path
+              data_path = os.path.join(path, "data")
+              if os.path.isfile(data_path):
+                  return data_path
+              if os.path.isdir(path):
+                  candidates = []
+                  for root, _, files in os.walk(path):
+                      for fn in files:
+                          if fn.startswith('.'):
+                              continue
+                          candidates.append(os.path.join(root, fn))
+                  if not candidates:
+                      raise FileNotFoundError(f"No files found inside directory: {path}")
+                  for ext in (".pth", ".pt", ".pkl", ".bin"):
+                      for c in candidates:
+                          if c.lower().endswith(ext):
+                              return c
+                  return sorted(candidates)[0]
+              # otherwise return as-is (may be e.g. a remote path handled elsewhere)
+              return path
+
+          def load_torch_obj(path):
+              actual = find_actual_file(path)
+              print(f"[eval] torch.load from: {actual}", file=sys.stdout)
+              return torch.load(actual, map_location="cpu")
+
+          def parse_config_input(config_input):
+              """
+              Accept either:
+                - path to a JSON file (existing file)
+                - or a raw JSON string (e.g. passed inline in args)
+              """
+              # If it's a file path
+              try:
+                  if os.path.exists(config_input):
+                      with open(config_input, "r") as f:
+                          return json.load(f)
+              except Exception:
+                  # fallthrough to try parse as string
+                  pass
+
+              # Try to parse as JSON string
+              try:
+                  return json.loads(config_input)
+              except Exception as e:
+                  raise ValueError(f"config_json is neither a valid file path nor a valid JSON string: {e}")
+
           parser = argparse.ArgumentParser(description="Evaluate LSTM model using nesy_factory.RNNs.LSTM")
-          parser.add_argument("--trained_model", required=True, help="Path to trained model checkpoint (torch-saved)")
-          parser.add_argument("--test_loader", required=True, help="Path to torch-saved test DataLoader/iterable")
-          parser.add_argument("--config_json", required=True, help="Path to external config JSON file")
+          parser.add_argument("--trained_model", required=True, help="Path to trained model checkpoint (torch-saved file/dir)")
+          parser.add_argument("--test_loader", required=True, help="Path to torch-saved test DataLoader/iterable (file/dir)")
+          parser.add_argument("--config_json", required=True, help="Path to JSON file or raw JSON string with model config")
           parser.add_argument("--metrics_json", required=True, help="Output path for metrics JSON (file)")
           args = parser.parse_args()
 
           print("[eval] Args:", args, file=sys.stdout)
 
           try:
-              # 1) load config
-              print(f"[eval] Loading config from: {args.config_json}", file=sys.stdout)
-              with open(args.config_json, "r") as f:
-                  config = json.load(f)
+              # 1) parse config (file or raw JSON)
+              print(f"[eval] Parsing config input...", file=sys.stdout)
+              config = parse_config_input(args.config_json)
               print("[eval] Config keys:", list(config.keys()), file=sys.stdout)
 
-              # 2) load checkpoint
-              print(f"[eval] Loading checkpoint from: {args.trained_model}", file=sys.stdout)
-              ckpt_path = args.trained_model
-              # try torch.load and fallback behavior for directories (allow 'data' inside)
-              def find_actual_file(path):
-                  if os.path.isfile(path):
-                      return path
-                  data_path = os.path.join(path, "data")
-                  if os.path.isfile(data_path):
-                      return data_path
-                  if os.path.isdir(path):
-                      candidates = []
-                      for root, _, files in os.walk(path):
-                          for fn in files:
-                              if fn.startswith('.'):
-                                  continue
-                              candidates.append(os.path.join(root, fn))
-                      if not candidates:
-                          raise FileNotFoundError(f"No files found inside directory: {path}")
-                      # prefer common extensions
-                      for ext in (".pth", ".pt", ".pkl", ".bin"):
-                          for c in candidates:
-                              if c.lower().endswith(ext):
-                                  return c
-                      return sorted(candidates)[0]
-                  return path
-
-              ckpt_actual = find_actual_file(ckpt_path)
-              print(f"[eval] Resolved checkpoint file: {ckpt_actual}", file=sys.stdout)
+              # 2) load checkpoint (resolve file inside dir if necessary)
+              print(f"[eval] Resolving checkpoint: {args.trained_model}", file=sys.stdout)
+              try:
+                  ckpt_actual = find_actual_file(args.trained_model)
+              except Exception as e:
+                  print("[eval] ERROR resolving trained_model path:", e, file=sys.stdout)
+                  raise
+              print(f"[eval] Loading checkpoint from: {ckpt_actual}", file=sys.stdout)
               checkpoint = torch.load(ckpt_actual, map_location="cpu")
-              print(f"[eval] Checkpoint type: {type(checkpoint)}", file=sys.stdout)
+              print(f"[eval] checkpoint type: {type(checkpoint)}", file=sys.stdout)
 
-              # checkpoint must contain model_state (state dict) or possibly be the model itself
               model_state = None
               model_instance = None
+              # Determine what's inside checkpoint
               if isinstance(checkpoint, dict):
                   if "model_state" in checkpoint:
                       model_state = checkpoint["model_state"]
                   elif "state_dict" in checkpoint:
                       model_state = checkpoint["state_dict"]
                   else:
-                      # maybe the dict is raw state_dict (heuristic)
+                      # raw state_dict heuristic
                       keys = list(checkpoint.keys())
                       if keys and isinstance(keys[0], str) and '.' in keys[0]:
                           model_state = checkpoint
-                      # or it might contain a saved model object under some key
-                      for k in ("model", "net", "module"):
-                          if k in checkpoint and hasattr(checkpoint[k], "__class__"):
-                              model_instance = checkpoint[k]
-                              break
+                      else:
+                          # maybe checkpoint contains a saved model instance under a common key
+                          for k in ("model", "net", "module"):
+                              if k in checkpoint and hasattr(checkpoint[k], "__class__"):
+                                  model_instance = checkpoint[k]
+                                  break
               else:
-                  # checkpoint might be a saved nn.Module instance if torch.save(model, path) used
+                  # checkpoint might be a saved nn.Module instance
                   model_instance = checkpoint
 
               # 3) import LSTM and instantiate with external config
               print("[eval] Importing LSTM from nesy_factory.RNNs ...", file=sys.stdout)
               from nesy_factory.RNNs import LSTM
 
-              print("[eval] Creating model instance using external config ...", file=sys.stdout)
+              print("[eval] Instantiating LSTM with provided config ...", file=sys.stdout)
               model = LSTM(config)
 
-              # if we found saved model instance, try to copy state, otherwise load state_dict if present
+              # load weights if available
               if model_instance is not None:
                   try:
-                      # if model_instance is an nn.Module, try to copy weights
                       model.load_state_dict(model_instance.state_dict(), strict=False)
                       print("[eval] Loaded weights from model instance in checkpoint.", file=sys.stdout)
                   except Exception as e:
-                      print("[eval] Warning: could not load weights from saved instance:", e, file=sys.stdout)
+                      print("[eval] Warning: could not load weights from saved model instance:", e, file=sys.stdout)
               elif model_state is not None:
-                  # strip module. prefix if present
+                  # strip module prefix if needed
                   new_state = {}
                   for k, v in model_state.items():
                       if k.startswith("module."):
@@ -152,25 +191,25 @@ implementation:
                   except Exception as e:
                       print("[eval] Warning: loading state_dict failed:", e, file=sys.stdout)
               else:
-                  print("[eval] WARNING: no model_state or model instance found in checkpoint; proceeding with freshly initialized model.", file=sys.stdout)
+                  print("[eval] Warning: no model state found in checkpoint; continuing with fresh model init.", file=sys.stdout)
 
-              # ensure optimizer & criterion exist on model (BaseRNN helper)
+              # ensure optimizer & criterion exist
               try:
                   model._init_optimizer_and_criterion()
               except Exception as e:
                   print("[eval] Warning: model._init_optimizer_and_criterion() failed:", e, file=sys.stdout)
 
-              # 4) load test loader
-              print(f"[eval] Loading test loader from: {args.test_loader}", file=sys.stdout)
-              test_path = args.test_loader
-              test_actual = find_actual_file(test_path)
+              # 4) load test loader (resolve file inside directory if necessary)
+              print(f"[eval] Resolving test_loader: {args.test_loader}", file=sys.stdout)
+              test_actual = find_actual_file(args.test_loader)
+              print(f"[eval] Loading test loader from: {test_actual}", file=sys.stdout)
               test_obj = torch.load(test_actual, map_location="cpu")
 
-              # model.eval_step expects an iterable/test dataloader saved via torch.save
+              # 5) run evaluation
               print("[eval] Running eval_step() ...", file=sys.stdout)
               metrics = model.eval_step(test_obj)
 
-              # normalize metrics values to native python floats where possible
+              # normalize to native python floats when possible
               def _norm(v):
                   if v is None:
                       return None
@@ -182,28 +221,23 @@ implementation:
 
               print("[eval] Metrics computed:", metrics, file=sys.stdout)
 
-              # 5) write metrics JSON atomically to output path
-              print(f"[eval] Writing metrics to: {args.metrics_json}", file=sys.stdout)
-              atomic_write_json = atomic_write_json if 'atomic_write_json' in globals() else None
           except Exception as e:
               print("[eval] ERROR during setup/eval:", e, file=sys.stdout)
               traceback.print_exc()
-              # still attempt to write an error JSON for debugging
+              # attempt to write an error JSON to outputs for debugging
               try:
-                  err_out = {"error": str(e)}
                   ensure_parent_dir(args.metrics_json)
                   with open(args.metrics_json, "w") as f:
-                      json.dump(err_out, f)
+                      json.dump({"error": str(e)}, f)
               except Exception:
                   pass
               sys.exit(1)
 
+          # 6) write metrics JSON atomically
           try:
-              # write metrics to provided output path
-              ensure_parent_dir(args.metrics_json)
-              with open(args.metrics_json, "w") as f:
-                  json.dump(metrics, f, indent=2)
-              print(f"[eval] Successfully wrote metrics to: {args.metrics_json}", file=sys.stdout)
+              print(f"[eval] Writing metrics to: {args.metrics_json}", file=sys.stdout)
+              atomic_write_json(args.metrics_json, metrics)
+              print("[eval] Successfully wrote metrics.", file=sys.stdout)
           except Exception as e:
               print("[eval] ERROR writing metrics JSON:", e, file=sys.stdout)
               traceback.print_exc()
