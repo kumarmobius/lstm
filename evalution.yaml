@@ -60,12 +60,6 @@ implementation:
                   raise
 
           def find_actual_file(path):
-              """
-              Resolve common artifact shapes:
-              - if path is a file -> return it
-              - if path is a directory and contains 'data' file -> return that
-              - else walk and choose a candidate file (prefer .pth/.pt/.pkl/.bin)
-              """
               if os.path.isfile(path):
                   return path
               data_path = os.path.join(path, "data")
@@ -94,11 +88,6 @@ implementation:
               return torch.load(actual, map_location="cpu")
 
           def parse_config_input(config_input):
-              """
-              Accept either:
-                - path to a JSON file (existing file)
-                - or a raw JSON string (e.g. passed inline in args)
-              """
               # If it's a file path
               try:
                   if os.path.exists(config_input):
