@@ -1,4 +1,4 @@
-name: Eval RNN Model v4
+name: Eval RNN Model v5
 inputs:
   - name: trained_model
     type: Model
@@ -216,4 +216,4 @@ implementation:
       - --config_json
       - { inputValue: config_json }
       - --metrics_json
-      - { inputPath: metrics_json }
+      - { outputPath: metrics_json }
