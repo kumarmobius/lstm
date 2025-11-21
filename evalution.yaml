@@ -1,4 +1,4 @@
-name: Eval RNN Model v7
+name: Eval RNN Model v7.1
 inputs:
   - name: trained_model
     type: Model
@@ -95,7 +95,7 @@ implementation:
                   except Exception as e_pickle:
                       print(f"[eval] pickle.load also failed: {e_pickle!r}", file=sys.stdout)
                       # raise the original torch error for context
-                      raise RuntimeError(f"Failed to load file with torch and pickle: {actual}\n torch_error: {e_torch}\n pickle_error: {e_pickle}")
+                      raise RuntimeError(f"Failed to load file with torch and pickle: {actual} torch_error: {e_torch} pickle_error: {e_pickle}")
 
           def parse_config_input(config_input):
               # If it's a file path
