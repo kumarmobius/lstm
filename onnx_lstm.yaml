@@ -1,0 +1,161 @@
+name: Convert LSTM to ONNX Using Triton Config
+description: Converts a PyTorch LSTM model to ONNX by reading input dims directly from a Triton config.pbtxt file.
+inputs:
+  - {name: pth_file, type: Model, description: "Directory containing model.pth"}
+  - {name: config_file, type: Model, description: "Directory containing config.pbtxt file"}
+  - {name: output_filename, type: String, default: "lstm_model.onnx", description: "Output ONNX file name"}
+outputs:
+  - {name: onnx_model, type: Model, description: "Converted ONNX model"}
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:testv2
+    command:
+      - sh
+      - -c
+      - |
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet onnx onnxruntime || \
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet onnx onnxruntime --user
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import os
+        import re
+        import sys
+        import torch
+        import torch.onnx
+        import numpy as np
+        import onnx
+        import onnxruntime as ort
+
+        # Import your model
+        from nesy_factory.RNNs import LSTM
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--pth_file', type=str, required=True)
+        parser.add_argument('--config_file', type=str, required=True)
+        parser.add_argument('--output_filename', type=str, default='lstm_model.onnx')
+        parser.add_argument('--onnx_model', type=str, required=True)
+        args = parser.parse_args()
+
+        pth_path = os.path.join(args.pth_file, "model.pth")
+        config_path = os.path.join(args.config_file, "config.pbtxt")
+
+        if not os.path.exists(pth_path):
+            print(f"ERROR: model.pth not found at {pth_path}")
+            sys.exit(1)
+
+        if not os.path.exists(config_path):
+            print(f"ERROR: config.pbtxt not found at {config_path}")
+            sys.exit(1)
+
+        # =============================
+        # Parse config.pbtxt for dims
+        # =============================
+        print("Reading config.pbtxt to extract model input dims...")
+
+        with open(config_path, "r") as f:
+            content = f.read()
+
+        # Extract dims: e.g. dims: [64, 6]
+        m = re.search(r"dims:\s*\[(.*?)\]", content)
+        if not m:
+            print("ERROR: Could not find input dims in config.pbtxt")
+            sys.exit(1)
+
+        dims = m.group(1).strip().split(',')
+        dims = [int(d.strip()) for d in dims]
+
+        if len(dims) != 2:
+            print("ERROR: Input dims must be 2D [seq_len, feature_dim]")
+            sys.exit(1)
+
+        seq_len, feature_dim = dims
+        print(f"Parsed dims from config: seq_len={seq_len}, feature_dim={feature_dim}")
+
+        # Output directory
+        os.makedirs(args.onnx_model, exist_ok=True)
+        output_path = os.path.join(args.onnx_model, args.output_filename)
+
+        # ============================
+        # Instantiate model
+        # ============================
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        hidden_size = 128
+        num_layers = 2
+        bidirectional = False
+        dropout = 0.0
+
+        print("Instantiating LSTM model...")
+        model = LSTM(
+            input_size=feature_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional
+        )
+
+        # Load weights
+        print("Loading model weights...")
+        state = torch.load(pth_path, map_location=device)
+
+        # Best-effort strict load
+        try:
+            model.load_state_dict(state, strict=True)
+            print("Loaded state_dict with strict=True")
+        except:
+            print("Strict load FAILED. Using strict=False.")
+            model.load_state_dict(state, strict=False)
+
+        model.to(device)
+        model.eval()
+
+        # Dummy input from config dims
+        batch_size = 1
+        dummy = torch.randn(batch_size, seq_len, feature_dim, device=device)
+
+        print("Exporting to ONNX...")
+        torch.onnx.export(
+            model,
+            dummy,
+            output_path,
+            input_names=["INPUT__0"],
+            output_names=["OUTPUT__0"],
+            dynamic_axes={
+                "INPUT__0": {0: "batch", 1: "seq_len"},
+                "OUTPUT__0": {0: "batch"}
+            },
+            opset_version=17
+        )
+
+        print("Validating ONNX...")
+        onnx_model = onnx.load(output_path)
+        onnx.checker.check_model(onnx_model)
+        print("ONNX model is valid.")
+
+        # Smoke test
+        print("Running ONNX Runtime smoke test...")
+        session = ort.InferenceSession(output_path)
+        input_name = session.get_inputs()[0].name
+        output_name = session.get_outputs()[0].name
+
+        out = session.run(
+            [output_name],
+            {input_name: dummy.cpu().numpy()}
+        )
+
+        print("Smoke test OK. Output shape:", out[0].shape)
+        print("Saved to:", output_path)
+
+    args:
+      - --pth_file
+      - {inputPath: pth_file}
+      - --config_file
+      - {inputPath: config_file}
+      - --output_filename
+      - {inputValue: output_filename}
+      - --onnx_model
+      - {outputPath: onnx_model}
