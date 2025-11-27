@@ -1,0 +1,90 @@
+name: CDN Download LSTM Files
+description: Downloads model.pth and config.pbtxt from CDN URLs and saves them in proper directory structure.
+inputs:
+  - {name: model_url, type: String, description: "CDN URL for model.pth"}
+  - {name: config_url, type: String, description: "CDN URL for config.pbtxt"}
+outputs:
+  - {name: pth_file, type: Model, description: "Directory containing downloaded model.pth"}
+  - {name: config_file, type: Model, description: "Directory containing downloaded config.pbtxt"}
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v25
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import os
+        import requests
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--model_url', type=str, required=True)
+        parser.add_argument('--pth_file', type=str, required=True)
+        parser.add_argument('--config_url', type=str, required=True)
+        parser.add_argument('--config_file', type=str, required=True)
+        args = parser.parse_args()
+
+        print("Received model_url:", args.model_url)
+        print("Received config_url:", args.config_url)
+
+        try:
+            # -------------------------------------------------------
+            # Download model.pth
+            # -------------------------------------------------------
+            print("Downloading model.pth from:", args.model_url)
+            resp_pth = requests.get(args.model_url, timeout=300)
+            resp_pth.raise_for_status()
+
+            os.makedirs(args.pth_file, exist_ok=True)
+            pth_path = os.path.join(args.pth_file, "model.pth")
+            with open(pth_path, "wb") as f:
+              f.write(resp_pth.content)
+
+            print("Saved model.pth at:", pth_path)
+            print("Size:", len(resp_pth.content), "bytes")
+
+            # -------------------------------------------------------
+            # Download config.pbtxt
+            # -------------------------------------------------------
+            print("Downloading config.pbtxt from:", args.config_url)
+            resp_cfg = requests.get(args.config_url, timeout=120)
+            resp_cfg.raise_for_status()
+
+            os.makedirs(args.config_file, exist_ok=True)
+            cfg_path = os.path.join(args.config_file, "config.pbtxt")
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                f.write(resp_cfg.text)
+
+            print("Saved config.pbtxt at:", cfg_path)
+            print("Size:", len(resp_cfg.text), "characters")
+
+            # -------------------------------------------------------
+            # Verification
+            # -------------------------------------------------------
+            if os.path.getsize(pth_path) == 0:
+                raise Exception("Downloaded model.pth is empty")
+
+            if os.path.getsize(cfg_path) == 0:
+                raise Exception("Downloaded config.pbtxt is empty")
+
+            print("All files downloaded and verified successfully!")
+
+        except requests.exceptions.RequestException as e:
+            print("Network error while downloading:", str(e))
+            exit(1)
+        except Exception as e:
+            print("Error:", str(e))
+            import traceback
+            traceback.print_exc()
+            exit(1)
+
+    args:
+      - --model_url
+      - {inputValue: model_url}
+      - --pth_file
+      - {outputPath: pth_file}
+      - --config_url
+      - {inputValue: config_url}
+      - --config_file
+      - {outputPath: config_file}
