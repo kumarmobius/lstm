@@ -8,7 +8,7 @@ outputs:
   - {name: onnx_model, type: Model, description: "Converted ONNX model"}
 implementation:
   container:
-    image: nikhilv215/nesy-factory:testv2
+    image: gurpreetgandhi/nesy-factory:v25
     command:
       - sh
       - -c
