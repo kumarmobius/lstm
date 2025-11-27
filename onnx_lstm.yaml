@@ -1,4 +1,4 @@
-name: LSTM ONNX v1
+name: LSTM ONNX v2
 description: Converts a PyTorch LSTM model to ONNX by reading input dims directly from a Triton config.pbtxt file.
 inputs:
   - {name: pth_file, type: Model, description: "Directory containing model.pth"}
@@ -21,6 +21,7 @@ implementation:
       - -c
       - |
         import argparse
+        import pickle
         import os
         import re
         import sys
@@ -101,16 +102,9 @@ implementation:
 
         # Load weights
         print("Loading model weights...")
-        state = torch.load(pth_path, map_location=device)
-
-        # Best-effort strict load
-        try:
-            model.load_state_dict(state, strict=True)
-            print("Loaded state_dict with strict=True")
-        except:
-            print("Strict load FAILED. Using strict=False.")
-            model.load_state_dict(state, strict=False)
-
+        print("Loading model via pickle...")
+        with open(pth_path, "rb") as f:
+            model = pickle.load(f)
         model.to(device)
         model.eval()
 
