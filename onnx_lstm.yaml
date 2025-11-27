@@ -1,4 +1,4 @@
-name: Convert LSTM to ONNX Using Triton Config
+name: LSTM ONNX v1
 description: Converts a PyTorch LSTM model to ONNX by reading input dims directly from a Triton config.pbtxt file.
 inputs:
   - {name: pth_file, type: Model, description: "Directory containing model.pth"}
@@ -84,19 +84,20 @@ implementation:
         # ============================
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        hidden_size = 128
-        num_layers = 2
-        bidirectional = False
-        dropout = 0.0
+        model_config = {
+            'input_dim': feature_dim,
+            'hidden_dim': 32,
+            'output_dim': 1,
+            'num_layers': 2,
+            'dropout': 0.1,
+            'optimizer': 'adam',
+            'learning_rate': 0.1,
+            'epochs': 20,
+            'loss_function': 'BCEWithLogitsLoss'
+        }
 
         print("Instantiating LSTM model...")
-        model = LSTM(
-            input_size=feature_dim,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout,
-            bidirectional=bidirectional
-        )
+        model = LSTM(model_config)
 
         # Load weights
         print("Loading model weights...")
@@ -115,7 +116,7 @@ implementation:
 
         # Dummy input from config dims
         batch_size = 1
-        dummy = torch.randn(batch_size, seq_len, feature_dim, device=device)
+        dummy = torch.randn(1, seq_len, feature_dim).to(device)
 
         print("Exporting to ONNX...")
         torch.onnx.export(
