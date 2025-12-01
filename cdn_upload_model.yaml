@@ -1,0 +1,129 @@
+name: Upload to CDN ONNX
+inputs:
+  - {name: model_onnx, type: Model}     # UPDATED
+  - {name: config_string, type: String} # kept (not uploaded), optional use
+  - {name: bearer_token, type: string}
+  - {name: domain, type: String}
+  - {name: get_cdn, type: String}
+  - {name: name, type: String}
+
+outputs:
+  - {name: model_onnx_cdn, type: String, description: "JSON containing the ONNX CDN URL (and optional name)"}
+
+implementation:
+  container:
+    image: python:3.8
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import subprocess
+        import json
+        import os
+        import uuid
+        import tempfile
+
+        parser = argparse.ArgumentParser(description="Upload ONNX model to CDN.")
+        parser.add_argument('--model_onnx', type=str, required=True)
+        parser.add_argument('--config_string', type=str, required=True)
+        parser.add_argument('--model_onnx_cdn', type=str, required=True)
+        parser.add_argument('--bearer_token', type=str, required=True)
+        parser.add_argument('--domain', type=str, required=True)
+        parser.add_argument('--get_cdn', type=str, required=True)
+        parser.add_argument('--name', type=str, default="", required=False)
+        args = parser.parse_args()
+
+        def ensure_parent_dir(path):
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+        def atomic_write_json(path, data):
+            ensure_parent_dir(path)
+            dirp = os.path.dirname(path) or "/tmp"
+            fd, tmp = tempfile.mkstemp(prefix="tmp_json_", dir=dirp)
+            try:
+              with os.fdopen(fd, "w") as f:
+                  json.dump(data, f)
+              os.replace(tmp, path)
+            except Exception:
+              try: os.remove(tmp)
+              except Exception: pass
+              raise
+
+        # Read bearer token
+        with open(args.bearer_token, 'r') as f:
+            bearer_token = f.read().strip()
+
+        upload_url = f"{args.domain}/mobius-content-service/v1.0/content/upload?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
+
+        def build_output_dict(key, url):
+            out = {key: url}
+            if args.name and args.name.strip():
+                out['name'] = args.name.strip()
+            return out
+
+        def upload_to_cdn(file_path, output_json_path, output_key):
+            print(f"[DEBUG] Uploading {file_path}")
+
+            curl_cmd = [
+                "curl",
+                "--location", upload_url,
+                "--header", f"Authorization: Bearer {bearer_token}",
+                "--form", f"file=@{file_path}",
+                "--fail",
+                "--show-error",
+            ]
+
+            process = subprocess.run(
+                curl_cmd, capture_output=True, check=True
+            )
+            stdout = process.stdout.decode("utf-8")
+            print("[DEBUG] Raw CDN Response:", stdout)
+
+            try:
+                response_json = json.loads(stdout)
+            except Exception:
+                print("[ERROR] CDN response is not valid JSON")
+                raise
+
+            rel_url = response_json.get("cdnUrl")
+            if not rel_url:
+                raise ValueError("CDN response missing cdnUrl")
+
+            final_url = f"{args.get_cdn}{rel_url}"
+
+            atomic_write_json(output_json_path, build_output_dict(output_key, final_url))
+            print(f"[INFO] Wrote output: {output_json_path}")
+
+            return final_url
+
+        # Upload ONNX
+        tmp_onnx = f"/tmp/model_{uuid.uuid4()}.onnx"
+        try:
+            with open(args.model_onnx, "rb") as src, open(tmp_onnx, "wb") as dst:
+                dst.write(src.read())
+            onnx_url = upload_to_cdn(tmp_onnx, args.model_onnx_cdn, "model_onnx_cdn")
+        finally:
+            try: os.remove(tmp_onnx)
+            except Exception: pass
+
+        print("ONNX CDN URL:", onnx_url)
+
+    args:
+      - --model_onnx
+      - {inputPath: model_onnx}
+      - --config_string
+      - {inputValue: config_string}
+      - --bearer_token
+      - {inputPath: bearer_token}
+      - --get_cdn
+      - {inputValue: get_cdn}
+      - --domain
+      - {inputValue: domain}
+      - --name
+      - {inputValue: name}
+      - --model_onnx_cdn
+      - {outputPath: model_onnx_cdn}
