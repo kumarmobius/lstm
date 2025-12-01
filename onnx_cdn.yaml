@@ -1,11 +1,11 @@
-name: CDN Download LSTM Files
+name: CDN Download onnx file
 description: Downloads model.pth and config.pbtxt from CDN URLs and saves them in proper directory structure.
 inputs:
   - {name: model_url, type: String, description: "CDN URL for model.pth"}
-  - {name: config_url, type: String, description: "CDN URL for config.pbtxt"}
+  - {name: config_pbtxt_url, type: String, description: "CDN URL for config.pbtxt"}
 outputs:
   - {name: pth_file, type: Model, description: "Directory containing downloaded model.pth"}
-  - {name: config_file, type: Model, description: "Directory containing downloaded config.pbtxt"}
+  - {name: config_pbtxt, type: Model, description: "Directory containing downloaded config.pbtxt"}
 implementation:
   container:
     image: gurpreetgandhi/nesy-factory:v25
@@ -21,17 +21,14 @@ implementation:
         parser = argparse.ArgumentParser()
         parser.add_argument('--model_url', type=str, required=True)
         parser.add_argument('--pth_file', type=str, required=True)
-        parser.add_argument('--config_url', type=str, required=True)
-        parser.add_argument('--config_file', type=str, required=True)
+        parser.add_argument('--config_pbtxt_url', type=str, required=True)
+        parser.add_argument('--config_pbtxt', type=str, required=True)
         args = parser.parse_args()
 
         print("Received model_url:", args.model_url)
-        print("Received config_url:", args.config_url)
+        print("Received config_pbtxt_url:", args.config_pbtxt_url)
 
         try:
-            # -------------------------------------------------------
-            # Download model.pth
-            # -------------------------------------------------------
             print("Downloading model.pth from:", args.model_url)
             resp_pth = requests.get(args.model_url, timeout=300)
             resp_pth.raise_for_status()
@@ -43,16 +40,12 @@ implementation:
 
             print("Saved model.pth at:", pth_path)
             print("Size:", len(resp_pth.content), "bytes")
-
-            # -------------------------------------------------------
-            # Download config.pbtxt
-            # -------------------------------------------------------
-            print("Downloading config.pbtxt from:", args.config_url)
-            resp_cfg = requests.get(args.config_url, timeout=120)
+            print("Downloading config.pbtxt from:", args.config_pbtxt_url)
+            resp_cfg = requests.get(args.config_pbtxt_url, timeout=120)
             resp_cfg.raise_for_status()
 
-            os.makedirs(args.config_file, exist_ok=True)
-            cfg_path = os.path.join(args.config_file, "config.pbtxt")
+            os.makedirs(args.config_pbtxt, exist_ok=True)
+            cfg_path = os.path.join(args.config_pbtxt, "config.pbtxt")
             with open(cfg_path, "w", encoding="utf-8") as f:
                 f.write(resp_cfg.text)
 
@@ -84,7 +77,7 @@ implementation:
       - {inputValue: model_url}
       - --pth_file
       - {outputPath: pth_file}
-      - --config_url
-      - {inputValue: config_url}
-      - --config_file
-      - {outputPath: config_file}
+      - --config_pbtxt_url
+      - {inputValue: config_pbtxt_url}
+      - --config_pbtxt
+      - {outputPath: config_pbtxt}
