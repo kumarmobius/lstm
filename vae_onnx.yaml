@@ -1,0 +1,140 @@
+name: Convert VAE to ONNX
+description: Loads a VAE model saved via pickle, rebuilds config, and exports StandardVAE/BetaVAE/CVAE to ONNX.
+inputs:
+  - {name: model_pth, type: Model, description: "Directory containing model.pth (pickle file)"}
+  - {name: config, type: String, description: "JSON config used to initialize the VAE"}
+  - {name: output_filename, type: String, default: "vae_model.onnx", description: "Output ONNX file name"}
+outputs:
+  - {name: onnx_model, type: Model, description: "Exported ONNX file"}
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v22
+    command:
+      - sh
+      - -c
+      - |
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet onnx onnxruntime || \
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet onnx onnxruntime --user
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import json
+        import os
+        import pickle
+        import torch
+        import torch.onnx
+        import onnx
+        import onnxruntime as ort
+
+        from nesy_factory.VAE.standard_vae import StandardVAE
+        from nesy_factory.VAE.beta_vae import BetaVAE
+        from nesy_factory.VAE.conditional_vae import ConditionalVAE
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--model_pth', type=str, required=True)
+        parser.add_argument('--config', type=str, required=True)
+        parser.add_argument('--output_filename', type=str, default="vae_model.onnx")
+        parser.add_argument('--onnx_model', type=str, required=True)
+        args = parser.parse_args()
+
+        # Load config
+        cfg = json.loads(args.config)
+        print("Loaded VAE config:", json.dumps(cfg, indent=2))
+
+        # Extract real input_dim
+        input_dim = cfg.get("processed_input_dim", cfg.get("input_dim"))
+        latent_dim = cfg["latent_dim"]
+        hidden_dim = cfg["hidden_dim"]
+        num_layers = cfg["num_layers"]
+        dropout = cfg["dropout"]
+
+        model_type = cfg.get("model_type", "StandardVAE")
+        print(f"Model type: {model_type}")
+
+        # Build model_config used by nesy_factory
+        model_config = {
+            "input_dim": input_dim,
+            "latent_dim": latent_dim,
+            "hidden_dim": hidden_dim,
+            "num_layers": num_layers,
+            "dropout": dropout,
+            "optimizer": "adam",
+            "learning_rate": cfg["learning_rate"],
+            "epochs": cfg["epochs"],
+            "loss_function": "ELBO"
+        }
+
+        # Load the pickle file (may contain full model or state_dict)
+        pth_path = os.path.join(args.model_pth, "model.pth")
+        print("Loading pickle model from:", pth_path)
+
+        with open(pth_path, "rb") as f:
+            loaded_obj = pickle.load(f)
+
+        # Case 1: pickle contained full model → use it
+        if isinstance(loaded_obj, (StandardVAE, BetaVAE, ConditionalVAE)):
+            model = loaded_obj
+            print("Loaded full VAE model object via pickle.")
+        else:
+            # Case 2: pickle contained state_dict → rebuild model, load state_dict
+            print("Loaded state_dict; rebuilding model...")
+            if model_type.lower() in ["standardvae", "standard_vae", "vae"]:
+                model = StandardVAE(model_config)
+            elif model_type.lower() in ["betavae", "beta_vae"]:
+                model = BetaVAE(model_config)
+            elif model_type.lower() in ["conditionalvae", "conditional_vae", "cvae"]:
+                model = ConditionalVAE(model_config)
+            else:
+                raise ValueError(f"Unsupported model type: {model_type}")
+
+            model.load_state_dict(loaded_obj, strict=False)
+            print("State_dict loaded into reconstructed model.")
+
+        model.eval()
+
+        # Create output directory
+        os.makedirs(args.onnx_model, exist_ok=True)
+        output_path = os.path.join(args.onnx_model, args.output_filename)
+
+        # Dummy input: VAE expects [batch, input_dim]
+        dummy_input = torch.randn(1, input_dim, dtype=torch.float32)
+
+        print("Exporting ONNX...")
+        torch.onnx.export(
+            model,
+            dummy_input,
+            output_path,
+            input_names=["INPUT__0"],
+            output_names=["RECON", "MU", "LOGVAR"],
+            dynamic_axes={
+                "INPUT__0": {0: "batch"},
+                "RECON": {0: "batch"},
+                "MU": {0: "batch"},
+                "LOGVAR": {0: "batch"}
+            },
+            opset_version=17
+        )
+
+        print("Validating ONNX...")
+        onnx_model = onnx.load(output_path)
+        onnx.checker.check_model(onnx_model)
+        print("ONNX validation OK.")
+
+        print("Testing inference with ONNX runtime...")
+        session = ort.InferenceSession(output_path)
+        out = session.run(None, {"INPUT__0": dummy_input.numpy()})
+        print("Inference OK. Output shapes:", [o.shape for o in out])
+
+        print("Saved ONNX model to:", output_path)
+    args:
+      - --model_pth
+      - {inputPath: model_pth}
+      - --config
+      - {inputValue: config}
+      - --output_filename
+      - {inputValue: output_filename}
+      - --onnx_model
+      - {outputPath: onnx_model}
