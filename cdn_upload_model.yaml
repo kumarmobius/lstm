@@ -1,7 +1,8 @@
-name: Upload to CDN ONNX
+name: Upload to CDN V1
+
 inputs:
-  - {name: model_onnx, type: Model}     # UPDATED
-  - {name: config_string, type: String} # kept (not uploaded), optional use
+  - {name: model_onnx, type: Model}
+  - {name: config_string, type: String}
   - {name: bearer_token, type: string}
   - {name: domain, type: String}
   - {name: get_cdn, type: String}
@@ -24,8 +25,10 @@ implementation:
         import os
         import uuid
         import tempfile
+        import traceback
+        from glob import iglob
 
-        parser = argparse.ArgumentParser(description="Upload ONNX model to CDN.")
+        parser = argparse.ArgumentParser(description="Upload ONNX model to CDN (robust to directory inputs).")
         parser.add_argument('--model_onnx', type=str, required=True)
         parser.add_argument('--config_string', type=str, required=True)
         parser.add_argument('--model_onnx_cdn', type=str, required=True)
@@ -45,19 +48,57 @@ implementation:
             dirp = os.path.dirname(path) or "/tmp"
             fd, tmp = tempfile.mkstemp(prefix="tmp_json_", dir=dirp)
             try:
-              with os.fdopen(fd, "w") as f:
-                  json.dump(data, f)
-              os.replace(tmp, path)
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f)
+                os.replace(tmp, path)
             except Exception:
-              try: os.remove(tmp)
-              except Exception: pass
-              raise
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                raise
+
+        def find_onnx_in_path(path):
+            # If path is file and endswith .onnx -> return it
+            if os.path.isfile(path):
+                if path.lower().endswith('.onnx'):
+                    return path
+                # maybe the uploaded file had a different name; still return it as candidate
+                return path
+            # If directory, search recursively for .onnx files
+            if os.path.isdir(path):
+                # prefer .onnx files
+                candidates = []
+                for root, dirs, files in os.walk(path):
+                    for fn in files:
+                        if fn.lower().endswith('.onnx'):
+                            candidates.append(os.path.join(root, fn))
+                if candidates:
+                    # choose the largest .onnx (heuristic)
+                    candidates.sort(key=lambda p: os.path.getsize(p), reverse=True)
+                    return candidates[0]
+                # fallback: if directory contains exactly one file, return it
+                flat_files = []
+                for root, dirs, files in os.walk(path):
+                    for fn in files:
+                        flat_files.append(os.path.join(root, fn))
+                if len(flat_files) == 1:
+                    return flat_files[0]
+                # no candidate found
+                return None
+            # path doesn't exist
+            return None
 
         # Read bearer token
-        with open(args.bearer_token, 'r') as f:
-            bearer_token = f.read().strip()
+        try:
+            with open(args.bearer_token, 'r') as f:
+                bearer_token = f.read().strip()
+        except Exception as e:
+            err = {"error": f"Failed to read bearer token: {e}"}
+            atomic_write_json(args.model_onnx_cdn, err)
+            raise
 
-        upload_url = f"{args.domain}/mobius-content-service/v1.0/content/upload?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
+        upload_url = f"{args.domain.rstrip('/')}/mobius-content-service/v1.0/content/upload?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
 
         def build_output_dict(key, url):
             out = {key: url}
@@ -65,9 +106,8 @@ implementation:
                 out['name'] = args.name.strip()
             return out
 
-        def upload_to_cdn(file_path, output_json_path, output_key):
-            print(f"[DEBUG] Uploading {file_path}")
-
+        def upload_to_cdn(file_path):
+            print(f"[DEBUG] Uploading file: {file_path}")
             curl_cmd = [
                 "curl",
                 "--location", upload_url,
@@ -76,41 +116,50 @@ implementation:
                 "--fail",
                 "--show-error",
             ]
+            proc = subprocess.run(curl_cmd, capture_output=True, check=True)
+            stdout = proc.stdout.decode("utf-8")
+            print("[DEBUG] Raw CDN response:", stdout)
+            try:
+                resp = json.loads(stdout)
+            except Exception as e:
+                raise RuntimeError(f"Failed to parse CDN response as JSON: {e}. Raw: {stdout}")
+            rel = resp.get("cdnUrl")
+            if not rel:
+                raise RuntimeError(f"CDN response missing 'cdnUrl': {resp}")
+            final = args.get_cdn.rstrip('/') + rel
+            return final
 
-            process = subprocess.run(
-                curl_cmd, capture_output=True, check=True
-            )
-            stdout = process.stdout.decode("utf-8")
-            print("[DEBUG] Raw CDN Response:", stdout)
+        # main flow
+        try:
+            resolved = find_onnx_in_path(args.model_onnx)
+            if not resolved:
+                raise FileNotFoundError(f"Could not find ONNX file in provided path: {args.model_onnx}")
+
+            # copy to a temp file with .onnx suffix to be safe
+            tmp_onnx = f"/tmp/model_{uuid.uuid4()}.onnx"
+            with open(resolved, "rb") as src, open(tmp_onnx, "wb") as dst:
+                dst.write(src.read())
 
             try:
-                response_json = json.loads(stdout)
-            except Exception:
-                print("[ERROR] CDN response is not valid JSON")
-                raise
+                final_url = upload_to_cdn(tmp_onnx)
+                out_obj = build_output_dict("model_onnx_cdn", final_url)
+                atomic_write_json(args.model_onnx_cdn, out_obj)
+                print("ONNX CDN URL:", final_url)
+            finally:
+                try: os.remove(tmp_onnx)
+                except Exception: pass
 
-            rel_url = response_json.get("cdnUrl")
-            if not rel_url:
-                raise ValueError("CDN response missing cdnUrl")
-
-            final_url = f"{args.get_cdn}{rel_url}"
-
-            atomic_write_json(output_json_path, build_output_dict(output_key, final_url))
-            print(f"[INFO] Wrote output: {output_json_path}")
-
-            return final_url
-
-        # Upload ONNX
-        tmp_onnx = f"/tmp/model_{uuid.uuid4()}.onnx"
-        try:
-            with open(args.model_onnx, "rb") as src, open(tmp_onnx, "wb") as dst:
-                dst.write(src.read())
-            onnx_url = upload_to_cdn(tmp_onnx, args.model_onnx_cdn, "model_onnx_cdn")
-        finally:
-            try: os.remove(tmp_onnx)
-            except Exception: pass
-
-        print("ONNX CDN URL:", onnx_url)
+        except Exception as e:
+            tb = traceback.format_exc()
+            print("[ERROR]", str(e))
+            print(tb)
+            err_obj = {"error": str(e), "traceback": tb}
+            try:
+                atomic_write_json(args.model_onnx_cdn, err_obj)
+            except Exception as e2:
+                print("[FATAL] Failed to write error JSON to output path:", e2)
+            # re-raise so pipeline logs show the error status too
+            raise
 
     args:
       - --model_onnx
