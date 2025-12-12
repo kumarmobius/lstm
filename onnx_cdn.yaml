@@ -8,7 +8,7 @@ outputs:
   - {name: config_pbtxt, type: Model, description: "Directory containing downloaded config.pbtxt"}
 implementation:
   container:
-    image: python:3.11-slim
+    image: gurpreetgandhi/nesy-factory:v35
     command:
       - python3
       - -u
