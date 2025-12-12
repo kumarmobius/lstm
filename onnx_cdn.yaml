@@ -1,10 +1,10 @@
-name: CDN Download onnx file
-description: Downloads model.pth and config.pbtxt from CDN URLs and saves them in proper directory structure.
+name: CDN Download onnx file v1
+description: Downloads model file (saved as model.<ext>) and config.pbtxt from CDN URLs and saves them in proper directory structure.
 inputs:
-  - {name: model_url, type: String, description: "CDN URL for model.pth"}
+  - {name: model_url, type: String, description: "CDN URL for model file (e.g. .onnx, .pth)"}
   - {name: config_pbtxt_url, type: String, description: "CDN URL for config.pbtxt"}
 outputs:
-  - {name: pth_file, type: Model, description: "Directory containing downloaded model.pth"}
+  - {name: pth_file, type: Model, description: "Directory containing downloaded model file (saved as model.<ext>)"}
   - {name: config_pbtxt, type: Model, description: "Directory containing downloaded config.pbtxt"}
 implementation:
   container:
@@ -17,6 +17,7 @@ implementation:
         import argparse
         import os
         import requests
+        import urllib.parse
 
         parser = argparse.ArgumentParser()
         parser.add_argument('--model_url', type=str, required=True)
@@ -29,17 +30,46 @@ implementation:
         print("Received config_pbtxt_url:", args.config_pbtxt_url)
 
         try:
-            print("Downloading model.pth from:", args.model_url)
-            resp_pth = requests.get(args.model_url, timeout=300)
-            resp_pth.raise_for_status()
+            print("Downloading model from:", args.model_url)
+            resp_model = requests.get(args.model_url, timeout=300)
+            resp_model.raise_for_status()
+
+            # Robust extraction of extension:
+            # - parse URL to get path (dropping query string)
+            # - take os.path.splitext of the path's basename
+            parsed = urllib.parse.urlparse(args.model_url)
+            path = parsed.path  # safe: no query string or fragments
+            basename = os.path.basename(path)
+            _, ext = os.path.splitext(basename)
+
+            if not ext:
+                # fallback: try to inspect Content-Type header (best-effort), otherwise use .bin
+                content_type = resp_model.headers.get("Content-Type", "")
+                if "onnx" in content_type:
+                    ext = ".onnx"
+                elif "torch" in content_type or "x-pytorch" in content_type or "pt" in content_type:
+                    ext = ".pth"
+                elif "octet-stream" in content_type or "application/octet-stream" in content_type:
+                    ext = ".bin"
+                else:
+                    ext = ".bin"
+
+            # Normalize ext to include leading dot (os.path.splitext already does)
+            if not ext.startswith("."):
+                ext = "." + ext
+
+            model_filename = f"model{ext}"
 
             os.makedirs(args.pth_file, exist_ok=True)
-            pth_path = os.path.join(args.pth_file, "model.pth")
-            with open(pth_path, "wb") as f:
-              f.write(resp_pth.content)
+            model_path = os.path.join(args.pth_file, model_filename)
 
-            print("Saved model.pth at:", pth_path)
-            print("Size:", len(resp_pth.content), "bytes")
+            with open(model_path, "wb") as f:
+                f.write(resp_model.content)
+
+            print("Saved model at:", model_path)
+            print("Size:", len(resp_model.content), "bytes")
+            print("Final model filename used:", model_filename)
+
             print("Downloading config.pbtxt from:", args.config_pbtxt_url)
             resp_cfg = requests.get(args.config_pbtxt_url, timeout=120)
             resp_cfg.raise_for_status()
@@ -52,14 +82,11 @@ implementation:
             print("Saved config.pbtxt at:", cfg_path)
             print("Size:", len(resp_cfg.text), "characters")
 
-            # -------------------------------------------------------
-            # Verification
-            # -------------------------------------------------------
-            if os.path.getsize(pth_path) == 0:
-                raise Exception("Downloaded model.pth is empty")
+            if os.path.getsize(model_path) == 0:
+                raise Exception(f"Downloaded model file is empty: {model_path}")
 
             if os.path.getsize(cfg_path) == 0:
-                raise Exception("Downloaded config.pbtxt is empty")
+                raise Exception(f"Downloaded config.pbtxt is empty: {cfg_path}")
 
             print("All files downloaded and verified successfully!")
 
