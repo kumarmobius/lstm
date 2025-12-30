@@ -25,7 +25,7 @@ implementation:
       - -u
       - -c
       - |
-          import argparse, json, os, sys, traceback, tempfile
+          import argparse, json, os, sys, traceback, tempfile, time
           import torch, pickle, math
           import numpy as np
 
@@ -329,35 +329,26 @@ implementation:
                   # OK
                   pass
 
-              # compute metrics
-              metrics = {"loss": float(avg_loss) if avg_loss is not None else None}
-
+              # compute metrics - store in temp variables
+              computed_accuracy = None
+              
               # try sklearn, otherwise fallback
               try:
                   from sklearn.metrics import precision_recall_fscore_support, accuracy_score, roc_auc_score
                   if is_binary:
                       precision, recall, f1, _ = precision_recall_fscore_support(y_all.astype(int), p_all.astype(int), average='binary', zero_division=0)
-                      accuracy = float(accuracy_score(y_all.astype(int), p_all.astype(int)))
-                      metrics.update({"accuracy": accuracy, "precision": float(precision), "recall": float(recall), "f1_score": float(f1)})
-                      # try auc if labels contain both classes
-                      try:
-                          if len(np.unique(y_all)) > 1:
-                              auc = float(roc_auc_score(y_all.astype(int), prob_all))
-                              metrics["roc_auc"] = auc
-                      except Exception as e:
-                          print("[eval] AUC compute failed:", e, file=sys.stdout)
+                      computed_accuracy = float(accuracy_score(y_all.astype(int), p_all.astype(int)))
+                      print(f"[eval] Computed metrics - accuracy: {computed_accuracy}, precision: {precision}, recall: {recall}, f1: {f1}", file=sys.stdout)
                   else:
                       # multiclass / regression: try macro averaging if preds are discrete
                       if p_all.dtype.kind in 'f' and np.all(np.mod(p_all,1)==0):
                           p_all_int = p_all.astype(int)
                           precision, recall, f1, _ = precision_recall_fscore_support(y_all.astype(int), p_all_int, average='macro', zero_division=0)
-                          accuracy = float(accuracy_score(y_all.astype(int), p_all_int))
-                          metrics.update({"accuracy": accuracy, "precision": float(precision), "recall": float(recall), "f1_score": float(f1)})
+                          computed_accuracy = float(accuracy_score(y_all.astype(int), p_all_int))
+                          print(f"[eval] Computed metrics - accuracy: {computed_accuracy}, precision: {precision}, recall: {recall}, f1: {f1}", file=sys.stdout)
                       else:
                           # regression metrics fallback
-                          mse = float(((prob_all - y_all.astype(float))**2).mean())
-                          mae = float(np.mean(np.abs(prob_all - y_all.astype(float))))
-                          metrics.update({"mse": mse, "mae": mae})
+                          print("[eval] Regression mode - no accuracy metric", file=sys.stdout)
               except Exception as e_sk:
                   print("[eval] sklearn metrics failed or unavailable:", e_sk, file=sys.stdout)
                   # manual safe computations
@@ -372,15 +363,22 @@ implementation:
                       recall = tp / (tp+fn) if (tp+fn)>0 else 0.0
                       acc = (tp+tn) / max(1, (tp+tn+fp+fn))
                       f1 = (2*precision*recall/(precision+recall)) if (precision+recall)>0 else 0.0
-                      metrics.update({"accuracy": float(acc), "precision": float(precision), "recall": float(recall), "f1_score": float(f1)})
+                      computed_accuracy = float(acc)
+                      print(f"[eval] Fallback computed metrics - accuracy: {computed_accuracy}, precision: {precision}, recall: {recall}, f1: {f1}", file=sys.stdout)
                   except Exception as e2:
                       print("[eval] Fallback manual metric computation failed:", e2, file=sys.stdout)
-                      metrics.update({"error": "metrics computation failed"})
 
-              print("[eval] Final metrics:", metrics, file=sys.stdout)
+              # Create final metrics JSON with timestamp, loss*100, accuracy*100
+              final_metrics = {
+                  "timestamp": int(time.time()),
+                  "loss": float(avg_loss * 100) if avg_loss is not None else None,
+                  "accuracy": float(computed_accuracy * 100) if computed_accuracy is not None else None
+              }
+
+              print("[eval] Final metrics:", final_metrics, file=sys.stdout)
 
               # write metrics
-              atomic_write_json(args.metrics_json, metrics)
+              atomic_write_json(args.metrics_json, final_metrics)
               print("[eval] Wrote metrics to:", args.metrics_json, file=sys.stdout)
 
           except Exception as e:
@@ -389,7 +387,7 @@ implementation:
               try:
                   ensure_parent_dir(args.metrics_json)
                   with open(args.metrics_json, "w") as f:
-                      json.dump({"error": str(e)}, f)
+                      json.dump({"timestamp": int(time.time()), "error": str(e)}, f)
               except Exception:
                   pass
               sys.exit(1)
