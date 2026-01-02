@@ -11,7 +11,7 @@ outputs:
   - {name: config_cdn_url, type: String, description: "JSON containing the config CDN URL (and optional name)"}
 implementation:
   container:
-    image: python:3.8
+    image: nikhilv215/nesy-factory:v23
     command:
       - python3
       - -u
