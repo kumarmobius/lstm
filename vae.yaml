@@ -1,4 +1,4 @@
-name: Partial Fit VAE Model
+name: Partial Fit VAE Model v1
 description: Loads an instantiated VAE and a .pth checkpoint, applies weights, partial-fits (fine-tunes) on incoming train data, and saves the model & epoch loss in the same style as Train VAE Model.
 inputs:
   - {name: model, type: Model}
@@ -21,6 +21,7 @@ implementation:
         import os
         import pickle
         import sys
+        import uuid
         import numpy as np
         import torch
         import torch.nn as nn
@@ -370,13 +371,14 @@ implementation:
             else:
                 avg_total = avg_recon = avg_kl = 0.0
 
+            # NEW FORMAT: flat structure with uid and training_mode
             epoch_loss_data.append({
                 'epoch': epoch + 1,
                 'loss': avg_total,
-                'custom_metrics': {
-                    'recon_loss': avg_recon,
-                    'kl_loss': avg_kl
-                }
+                'recon_loss': avg_recon,
+                'kl_loss': avg_kl,
+                'training_mode': 'traditional',
+                'uid': str(uuid.uuid4())
             })
             print(f"[partial_fit_vae] Epoch {epoch+1}/{finetune_epochs} -> loss={avg_total:.6f}, recon={avg_recon:.6f}, kl={avg_kl:.6f}")
 
