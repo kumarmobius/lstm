@@ -1,4 +1,4 @@
-name: Partial Fit LSTM v9
+name: Partial Fit LSTM v10
 inputs:
   - {name: model_object, type: Model}
   - {name: pth_file, type: Model}
@@ -11,7 +11,7 @@ outputs:
   - {name: parameter_count, type: String}
 implementation:
   container:
-    image: gurpreetgandhi/nesy-factory:v30
+    image: gurpreetgandhi/nesy-factory:v25
     command:
       - python3
       - -u
