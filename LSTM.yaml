@@ -11,7 +11,7 @@ outputs:
   - {name: parameter_count, type: String}
 implementation:
   container:
-    image: nikhilv215/nesy-factory:v23
+    image: gurpreetgandhi/nesy-factory:v30
     command:
       - python3
       - -u
