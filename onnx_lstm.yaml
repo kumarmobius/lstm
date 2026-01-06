@@ -1,9 +1,9 @@
-name: LSTM ONNX v3
-description: Converts a PyTorch LSTM model to ONNX by reading model and architecture from a JSON config string.
+name: LSTM ONNX v2
+description: Converts a PyTorch LSTM model to ONNX by reading input dims directly from a Triton config.pbtxt file.
 inputs:
   - {name: pth_file, type: Model, description: "Directory containing model.pth"}
-  - {name: config, type: String, description: "JSON model configuration (see example below)"}
-  - {name: output_filename, type: String, default: "lstm_model.onnx", description: "Output ONNX file name"}
+  - {name: config_file, type: Model, description: "Directory containing config.pbtxt file"}
+  - {name: output_filename, type: String, default: "model.onnx", description: "Output ONNX file name"}
 outputs:
   - {name: onnx_model, type: Model, description: "Converted ONNX model"}
 implementation:
@@ -21,156 +21,135 @@ implementation:
       - -c
       - |
         import argparse
-        import json
         import pickle
         import os
+        import re
         import sys
         import torch
         import torch.onnx
+        import numpy as np
         import onnx
         import onnxruntime as ort
 
-        # Import your model class
+        # Import your model
         from nesy_factory.RNNs import LSTM
 
         parser = argparse.ArgumentParser()
         parser.add_argument('--pth_file', type=str, required=True)
-        parser.add_argument('--config', type=str, required=True)
+        parser.add_argument('--config_file', type=str, required=True)
         parser.add_argument('--output_filename', type=str, default='lstm_model.onnx')
         parser.add_argument('--onnx_model', type=str, required=True)
         args = parser.parse_args()
 
         pth_path = os.path.join(args.pth_file, "model.pth")
+        config_path = os.path.join(args.config_file, "config.pbtxt")
 
         if not os.path.exists(pth_path):
             print(f"ERROR: model.pth not found at {pth_path}")
             sys.exit(1)
 
-        # -------------------------
-        # Parse JSON config (single source of truth)
-        # -------------------------
-        print("Parsing JSON config...")
-        try:
-            cfg = json.loads(args.config)
-        except Exception as e:
-            print("ERROR: Failed to parse JSON config:", e)
+        if not os.path.exists(config_path):
+            print(f"ERROR: config.pbtxt not found at {config_path}")
             sys.exit(1)
 
-        print("Loaded config:")
-        print(json.dumps(cfg, indent=2))
+        # =============================
+        # Parse config.pbtxt for dims
+        # =============================
+        print("Reading config.pbtxt to extract model input dims...")
 
-        # Required fields
-        seq_len = cfg.get("seq_length")
-        feature_dim = cfg.get("processed_input_dim") or cfg.get("input_dim")
+        with open(config_path, "r") as f:
+            content = f.read()
 
-        if seq_len is None or feature_dim is None:
-            print("ERROR: JSON config must include 'seq_length' and 'processed_input_dim' (or 'input_dim')")
+        # Extract dims: e.g. dims: [64, 6]
+        m = re.search(r"dims:\s*\[(.*?)\]", content)
+        if not m:
+            print("ERROR: Could not find input dims in config.pbtxt")
             sys.exit(1)
 
-        try:
-            seq_len = int(seq_len)
-            feature_dim = int(feature_dim)
-        except Exception:
-            print("ERROR: seq_length and processed_input_dim must be integers")
+        dims = m.group(1).strip().split(',')
+        dims = [int(d.strip()) for d in dims]
+
+        if len(dims) != 2:
+            print("ERROR: Input dims must be 2D [seq_len, feature_dim]")
             sys.exit(1)
 
-        # Build model_config from JSON
-        model_config = {
-            'input_dim': feature_dim,
-            'hidden_dim': cfg.get('hidden_dim', 32),
-            'output_dim': cfg.get('output_dim', 1),
-            'num_layers': cfg.get('num_layers', 1),
-            'dropout': cfg.get('dropout', 0.0),
-            'optimizer': cfg.get('optimizer', 'adam'),
-            'learning_rate': cfg.get('learning_rate', 0.001),
-            'epochs': cfg.get('epochs', 1),
-            'loss_function': cfg.get('loss_function', 'BCEWithLogitsLoss')
-        }
-
-        print("Model config constructed:")
-        print(json.dumps(model_config, indent=2))
+        seq_len, feature_dim = dims
+        print(f"Parsed dims from config: seq_len={seq_len}, feature_dim={feature_dim}")
 
         # Output directory
         os.makedirs(args.onnx_model, exist_ok=True)
         output_path = os.path.join(args.onnx_model, args.output_filename)
 
-        # ---------------------------
-        # Instantiate / load model
-        # ---------------------------
+        # ============================
+        # Instantiate model
+        # ============================
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        print("Attempting to load pickled model from:", pth_path)
-        with open(pth_path, 'rb') as f:
-            loaded_obj = pickle.load(f)
+        model_config = {
+            'input_dim': feature_dim,
+            'hidden_dim': 32,
+            'output_dim': 1,
+            'num_layers': 2,
+            'dropout': 0.1,
+            'optimizer': 'adam',
+            'learning_rate': 0.1,
+            'epochs': 20,
+            'loss_function': 'BCEWithLogitsLoss'
+        }
 
-        # If the pickle contains the full model object, use it
-        if isinstance(loaded_obj, LSTM):
-            model = loaded_obj
-            print("Loaded full LSTM model object from pickle.")
-        else:
-            # Otherwise assume it's a state_dict and rebuild the model
-            print("Pickle does not contain full model object. Rebuilding LSTM from model_config...")
-            model = LSTM(model_config)
-            try:
-                model.load_state_dict(loaded_obj, strict=False)
-                print("Loaded state_dict into reconstructed model.")
-            except Exception as e:
-                print("ERROR: Failed to load state_dict into LSTM:", e)
-                print("If the pickle contains a different object, you must provide a compatible state_dict or a full model pickle.")
-                sys.exit(1)
+        print("Instantiating LSTM model...")
+        model = LSTM(model_config)
 
+        # Load weights
+        print("Loading model weights...")
+        print("Loading model via pickle...")
+        with open(pth_path, "rb") as f:
+            model = pickle.load(f)
         model.to(device)
         model.eval()
 
-        # Dummy input: shape [batch, seq_len, feature_dim]
+        # Dummy input from config dims
         batch_size = 1
-        dummy = torch.randn(batch_size, seq_len, feature_dim, dtype=torch.float32).to(device)
+        dummy = torch.randn(1, seq_len, feature_dim).to(device)
 
-        print("Exporting to ONNX at:", output_path)
-        try:
-            torch.onnx.export(
-                model,
-                dummy,
-                output_path,
-                input_names=["INPUT__0"],
-                output_names=["OUTPUT__0"],
-                dynamic_axes={
-                    "INPUT__0": {0: "batch", 1: "seq_len"},
-                    "OUTPUT__0": {0: "batch"}
-                },
-                opset_version=17,
-                do_constant_folding=True,
-            )
-        except Exception as e:
-            print("ERROR: ONNX export failed:", e)
-            sys.exit(1)
+        print("Exporting to ONNX...")
+        torch.onnx.export(
+            model,
+            dummy,
+            output_path,
+            input_names=["INPUT__0"],
+            output_names=["OUTPUT__0"],
+            dynamic_axes={
+                "INPUT__0": {0: "batch", 1: "seq_len"},
+                "OUTPUT__0": {0: "batch"}
+            },
+            opset_version=17
+        )
 
-        print("Validating ONNX model...")
-        try:
-            onnx_model = onnx.load(output_path)
-            onnx.checker.check_model(onnx_model)
-            print("ONNX validation OK.")
-        except Exception as e:
-            print("ERROR: ONNX validation failed:", e)
-            sys.exit(1)
+        print("Validating ONNX...")
+        onnx_model = onnx.load(output_path)
+        onnx.checker.check_model(onnx_model)
+        print("ONNX model is valid.")
 
+        # Smoke test
         print("Running ONNX Runtime smoke test...")
-        try:
-            session = ort.InferenceSession(output_path)
-            input_name = session.get_inputs()[0].name
-            output_name = session.get_outputs()[0].name
-            out = session.run([output_name], {input_name: dummy.cpu().numpy()})
-            print("Smoke test OK. Output shape:", out[0].shape)
-        except Exception as e:
-            print("ERROR: ONNX Runtime inference failed:", e)
-            sys.exit(1)
+        session = ort.InferenceSession(output_path)
+        input_name = session.get_inputs()[0].name
+        output_name = session.get_outputs()[0].name
 
-        print("Saved ONNX model to:", output_path)
+        out = session.run(
+            [output_name],
+            {input_name: dummy.cpu().numpy()}
+        )
+
+        print("Smoke test OK. Output shape:", out[0].shape)
+        print("Saved to:", output_path)
+
     args:
       - --pth_file
       - {inputPath: pth_file}
-      - --config
-      - {inputValue: config}
+      - --config_file
+      - {inputPath: config_file}
       - --output_filename
       - {inputValue: output_filename}
       - --onnx_model
